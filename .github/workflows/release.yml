@@ -7,12 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '版本号 (例如: v2.0.0)'
+        description: '版本号 (例如: v3.0.0)'
         required: true
         type: string
 
 env:
-  GO_VERSION: '1.24' # 已根据你的环境更新到 1.24
+  GO_VERSION: '1.24'
   BINARY_NAME: phantom-server
 
 permissions:
@@ -26,7 +26,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
     steps:
-      - name: 确定版本
+      - name: Determine Version
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
@@ -37,11 +37,29 @@ jobs:
           VERSION="${TAG#v}"
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "📦 Version: ${VERSION}, Tag: ${TAG}"
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          
+      - run: go mod download
+      
+      - name: Run Tests
+        run: go test -v -race ./...
 
   build:
     name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
-    needs: prepare
+    needs: [prepare, test]
     strategy:
       fail-fast: false
       matrix:
@@ -64,22 +82,22 @@ jobs:
             goarch: amd64
 
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 设置 Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
           cache-dependency-path: go.sum
 
-      - name: 下载依赖
+      - name: Download Dependencies
         run: go mod download
 
-      - name: 构建
+      - name: Build Binary
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -93,7 +111,7 @@ jobs:
           ARCH_SUFFIX="${{ matrix.goarch }}"
           [[ "${{ matrix.goarch }}" == "arm" ]] && ARCH_SUFFIX="armv${{ matrix.goarm }}"
           
-          BINARY="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${ARCH_SUFFIX}${{ matrix.ext }}"
+          BINARY="${{ env.BINARY_NAME }}${{ matrix.ext }}"
           
           go build -trimpath \
             -ldflags "-s -w \
@@ -103,38 +121,45 @@ jobs:
             -o "${BINARY}" \
             ./cmd/phantom-server
           
-          echo "BINARY=${BINARY}" >> $GITHUB_ENV
           echo "ARCH_SUFFIX=${ARCH_SUFFIX}" >> $GITHUB_ENV
 
-      - name: 打包
+      - name: Package
         run: |
           ARCHIVE_NAME="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ env.ARCH_SUFFIX }}"
           
           mkdir -p package
-          cp "${{ env.BINARY }}" package/
-          # 检查文件是否存在再拷贝，避免报错
-          if [ -f configs/config.example.yaml ]; then cp configs/config.example.yaml package/config.yaml; fi
-          if [ -f README.md ]; then cp README.md package/; fi
-          if [ -f LICENSE ]; then cp LICENSE package/; fi
           
+          # 复制二进制文件
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            FILE_NAME="${ARCHIVE_NAME}.zip"
-            cd package && zip -r "../$FILE_NAME" . && cd ..
+            cp "${{ env.BINARY_NAME }}.exe" package/
           else
-            FILE_NAME="${ARCHIVE_NAME}.tar.gz"
-            tar -czvf "$FILE_NAME" -C package .
+            cp "${{ env.BINARY_NAME }}" package/
+            chmod +x "package/${{ env.BINARY_NAME }}"
           fi
           
-          # 修正这里：直接使用 Shell 变量 FILE_NAME，而不是 GitHub 上下文
-          sha256sum "$FILE_NAME" > "$FILE_NAME.sha256"
+          # 复制配置和文档
+          [ -f configs/config.example.yaml ] && cp configs/config.example.yaml package/config.yaml
+          [ -f README.md ] && cp README.md package/
+          [ -f LICENSE ] && cp LICENSE package/
           
-          # 传递给后续步骤
-          echo "ARCHIVE=$FILE_NAME" >> $GITHUB_ENV
+          # 创建压缩包
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            FILE_NAME="${ARCHIVE_NAME}.zip"
+            cd package && zip -r "../${FILE_NAME}" . && cd ..
+          else
+            FILE_NAME="${ARCHIVE_NAME}.tar.gz"
+            tar -czvf "${FILE_NAME}" -C package .
+          fi
+          
+          # 生成校验和
+          sha256sum "${FILE_NAME}" > "${FILE_NAME}.sha256"
+          
+          echo "ARCHIVE=${FILE_NAME}" >> $GITHUB_ENV
 
-      - name: 上传产物
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: release-${{ matrix.goos }}-${{ env.ARCH_SUFFIX }}
           path: |
             *.tar.gz
             *.zip
@@ -142,71 +167,115 @@ jobs:
           retention-days: 1
 
   release:
-    name: Release
+    name: Create Release
     runs-on: ubuntu-latest
     needs: [prepare, build]
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 下载产物
+      - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           pattern: release-*
 
-      - name: 整理文件
+      - name: Organize Files
         run: |
           mkdir -p release
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec mv {} release/ \;
-          cd release && cat *.sha256 > checksums.txt
+          cd release
+          cat *.sha256 > checksums.txt
+          echo "📦 Release files:"
           ls -la
 
-      - name: 生成发布说明
+      - name: Generate Release Notes
         run: |
           TAG="${{ needs.prepare.outputs.tag }}"
-          cat > release-notes.md << EOF
-          # 🚀 Phantom Server ${TAG}
+          VERSION="${{ needs.prepare.outputs.version }}"
+          REPO="${{ github.repository }}"
+          
+          cat > release-notes.md << 'NOTES_EOF'
+          # 🚀 Phantom Server $TAG
           
           ## ✨ 特性
           
           - 🎯 **极简设计** - 约 600 行核心代码
-          - 🔒 **TSKD 认证** - 时间同步密钥派生，0-RTT
+          - 🔒 **TSKD 认证** - 时间同步密钥派生，0-RTT 无握手
           - 🛡️ **ChaCha20-Poly1305** - 高性能 AEAD 加密
-          - 👻 **抗探测** - 全密文传输，静默丢弃
+          - 👻 **抗探测** - 全密文传输，静默丢弃无效请求
+          - ⚡ **高性能** - 纯 UDP，无连接状态开销
+          
+          ## 🚀 一键安装
+          
+          ```bash
+          bash <(curl -fsSL https://raw.githubusercontent.com/$REPO/main/scripts/install.sh) install
+          ```
           
           ## 📦 下载
           
           | 平台 | 架构 | 下载 |
           |------|------|------|
-          | Linux | amd64 | [phantom-server-linux-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-linux-amd64.tar.gz) |
-          | Linux | arm64 | [phantom-server-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-linux-arm64.tar.gz) |
-          | Linux | armv7 | [phantom-server-linux-armv7.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-linux-armv7.tar.gz) |
-          | macOS | amd64 | [phantom-server-darwin-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-darwin-amd64.tar.gz) |
-          | macOS | arm64 | [phantom-server-darwin-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-darwin-arm64.tar.gz) |
-          | Windows | amd64 | [phantom-server-windows-amd64.zip](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-windows-amd64.zip) |
-          | FreeBSD | amd64 | [phantom-server-freebsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-freebsd-amd64.tar.gz) |
+          | Linux | amd64 | [phantom-server-linux-amd64.tar.gz](https://github.com/$REPO/releases/download/$TAG/phantom-server-linux-amd64.tar.gz) |
+          | Linux | arm64 | [phantom-server-linux-arm64.tar.gz](https://github.com/$REPO/releases/download/$TAG/phantom-server-linux-arm64.tar.gz) |
+          | Linux | armv7 | [phantom-server-linux-armv7.tar.gz](https://github.com/$REPO/releases/download/$TAG/phantom-server-linux-armv7.tar.gz) |
+          | macOS | amd64 | [phantom-server-darwin-amd64.tar.gz](https://github.com/$REPO/releases/download/$TAG/phantom-server-darwin-amd64.tar.gz) |
+          | macOS | arm64 | [phantom-server-darwin-arm64.tar.gz](https://github.com/$REPO/releases/download/$TAG/phantom-server-darwin-arm64.tar.gz) |
+          | Windows | amd64 | [phantom-server-windows-amd64.zip](https://github.com/$REPO/releases/download/$TAG/phantom-server-windows-amd64.zip) |
+          | FreeBSD | amd64 | [phantom-server-freebsd-amd64.tar.gz](https://github.com/$REPO/releases/download/$TAG/phantom-server-freebsd-amd64.tar.gz) |
           
           ## 📋 校验和
           
           <details>
-          <summary>SHA256</summary>
+          <summary>SHA256 Checksums</summary>
           
-          \`\`\`
-          $(cat release/checksums.txt)
-          \`\`\`
+          ```
+          NOTES_EOF
+          
+          cat release/checksums.txt >> release-notes.md
+          
+          cat >> release-notes.md << 'NOTES_EOF'
+          ```
           
           </details>
-          EOF
+          
+          ## 📖 使用说明
+          
+          ### 服务端配置
+          
+          ```yaml
+          listen: ":54321"
+          psk: "YOUR_PSK_HERE"
+          time_window: 30
+          log_level: "info"
+          ```
+          
+          ### 管理命令
+          
+          ```bash
+          # 启动/停止/重启
+          systemctl start|stop|restart phantom
+          
+          # 查看日志
+          journalctl -u phantom -f
+          
+          # 查看状态
+          systemctl status phantom
+          ```
+          NOTES_EOF
+          
+          # 替换变量
+          sed -i "s|\$TAG|${TAG}|g" release-notes.md
+          sed -i "s|\$REPO|${REPO}|g" release-notes.md
 
-      - name: 创建 Release
-        uses: softprops/action-gh-release@v1
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: Phantom Server ${{ needs.prepare.outputs.tag }}
           body_path: release-notes.md
           draft: false
-          prerelease: ${{ contains(needs.prepare.outputs.tag, 'alpha') || contains(needs.prepare.outputs.tag, 'beta') }}
+          prerelease: ${{ contains(needs.prepare.outputs.tag, 'alpha') || contains(needs.prepare.outputs.tag, 'beta') || contains(needs.prepare.outputs.tag, 'rc') }}
           files: |
             release/*.tar.gz
             release/*.zip
