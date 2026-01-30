@@ -16,7 +16,11 @@ func TestGeneratePSK(t *testing.T) {
 }
 
 func TestNewCrypto(t *testing.T) {
-	psk, _ := GeneratePSK()
+	psk, err := GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK 失败: %v", err)
+	}
+
 	c, err := New(psk, 30)
 	if err != nil {
 		t.Fatalf("创建 Crypto 失败: %v", err)
@@ -29,8 +33,15 @@ func TestNewCrypto(t *testing.T) {
 }
 
 func TestEncryptDecrypt(t *testing.T) {
-	psk, _ := GeneratePSK()
-	c, _ := New(psk, 30)
+	psk, err := GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK 失败: %v", err)
+	}
+
+	c, err := New(psk, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto 失败: %v", err)
+	}
 
 	plaintext := []byte("Hello, Phantom v3!")
 
@@ -50,14 +61,24 @@ func TestEncryptDecrypt(t *testing.T) {
 }
 
 func TestReplayProtection(t *testing.T) {
-	psk, _ := GeneratePSK()
-	c, _ := New(psk, 30)
+	psk, err := GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK 失败: %v", err)
+	}
+
+	c, err := New(psk, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto 失败: %v", err)
+	}
 
 	plaintext := []byte("Test replay")
-	encrypted, _ := c.Encrypt(plaintext)
+	encrypted, err := c.Encrypt(plaintext)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
 
 	// 第一次解密应该成功
-	_, err := c.Decrypt(encrypted)
+	_, err = c.Decrypt(encrypted)
 	if err != nil {
 		t.Fatalf("首次解密失败: %v", err)
 	}
@@ -70,24 +91,49 @@ func TestReplayProtection(t *testing.T) {
 }
 
 func TestInvalidPSK(t *testing.T) {
-	psk1, _ := GeneratePSK()
-	psk2, _ := GeneratePSK()
+	psk1, err := GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK1 失败: %v", err)
+	}
 
-	c1, _ := New(psk1, 30)
-	c2, _ := New(psk2, 30)
+	psk2, err := GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK2 失败: %v", err)
+	}
+
+	c1, err := New(psk1, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto1 失败: %v", err)
+	}
+
+	c2, err := New(psk2, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto2 失败: %v", err)
+	}
 
 	plaintext := []byte("Test message")
-	encrypted, _ := c1.Encrypt(plaintext)
+	encrypted, err := c1.Encrypt(plaintext)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
 
-	_, err := c2.Decrypt(encrypted)
+	_, err = c2.Decrypt(encrypted)
 	if err == nil {
 		t.Fatal("使用错误的 PSK 解密应该失败")
 	}
 }
 
 func BenchmarkEncrypt(b *testing.B) {
-	psk, _ := GeneratePSK()
-	c, _ := New(psk, 30)
+	psk, err := GeneratePSK()
+	if err != nil {
+		b.Fatalf("生成 PSK 失败: %v", err)
+	}
+
+	c, err := New(psk, 30)
+	if err != nil {
+		b.Fatalf("创建 Crypto 失败: %v", err)
+	}
+
 	data := make([]byte, 1024)
 
 	b.ResetTimer()
@@ -97,15 +143,25 @@ func BenchmarkEncrypt(b *testing.B) {
 }
 
 func BenchmarkDecrypt(b *testing.B) {
-	psk, _ := GeneratePSK()
-	c, _ := New(psk, 30)
+	psk, err := GeneratePSK()
+	if err != nil {
+		b.Fatalf("生成 PSK 失败: %v", err)
+	}
+
+	c, err := New(psk, 30)
+	if err != nil {
+		b.Fatalf("创建 Crypto 失败: %v", err)
+	}
+
 	data := make([]byte, 1024)
-	encrypted, _ := c.Encrypt(data)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		// 需要每次生成新的加密数据，因为有重放保护
-		encrypted, _ = c.Encrypt(data)
+		// 每次生成新的加密数据，因为有重放保护
+		encrypted, err := c.Encrypt(data)
+		if err != nil {
+			b.Fatalf("加密失败: %v", err)
+		}
 		_, _ = c.Decrypt(encrypted)
 	}
 }
