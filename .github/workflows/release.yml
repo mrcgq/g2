@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '版本号 (例如: v2.0.0)'
+        required: true
+        type: string
 
 env:
   GO_VERSION: '1.21'
@@ -13,48 +19,199 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: Release
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - name: 确定版本
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: 7
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: freebsd
+            goarch: amd64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - name: 设置 Go
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+          cache-dependency-path: go.sum
 
-      - name: Build All Platforms
+      - name: 下载依赖
+        run: go mod download
+
+      - name: 构建
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION="${{ needs.prepare.outputs.version }}"
           COMMIT=$(git rev-parse --short HEAD)
-          DATE=$(date -u '+%Y-%m-%d %H:%M:%S')
-          LDFLAGS="-s -w -X 'main.Version=${VERSION}' -X 'main.BuildTime=${DATE}' -X 'main.GitCommit=${COMMIT}'"
+          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
           
-          mkdir -p release
+          ARCH_SUFFIX="${{ matrix.goarch }}"
+          [[ "${{ matrix.goarch }}" == "arm" ]] && ARCH_SUFFIX="armv${{ matrix.goarm }}"
           
-          platforms=("linux/amd64" "linux/arm64" "linux/arm/7" "darwin/amd64" "darwin/arm64" "freebsd/amd64")
+          BINARY="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${ARCH_SUFFIX}${{ matrix.ext }}"
           
-          for platform in "${platforms[@]}"; do
-            IFS='/' read -r GOOS GOARCH GOARM <<< "$platform"
-            output="${{ env.BINARY_NAME }}-${GOOS}-${GOARCH}"
-            [[ -n "$GOARM" ]] && output="${{ env.BINARY_NAME }}-${GOOS}-armv${GOARM}"
-            
-            GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM CGO_ENABLED=0 \
-              go build -trimpath -ldflags "$LDFLAGS" -o "release/${output}" ./cmd/phantom-server
-            
-            tar -czf "release/${output}.tar.gz" -C release "${output}" 
-            rm "release/${output}"
-          done
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X 'main.Version=${VERSION}' \
+              -X 'main.BuildTime=${BUILD_TIME}' \
+              -X 'main.GitCommit=${COMMIT}'" \
+            -o "${BINARY}" \
+            ./cmd/phantom-server
           
-          cd release && sha256sum *.tar.gz > checksums.txt
+          echo "BINARY=${BINARY}" >> $GITHUB_ENV
+          echo "ARCH_SUFFIX=${ARCH_SUFFIX}" >> $GITHUB_ENV
 
-      - name: Create Release
+      - name: 打包
+        run: |
+          ARCHIVE_NAME="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ env.ARCH_SUFFIX }}"
+          
+          mkdir -p package
+          cp "${{ env.BINARY }}" package/
+          cp configs/config.example.yaml package/config.yaml
+          cp README.md package/
+          cp LICENSE package/
+          
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            cd package && zip -r "../${ARCHIVE_NAME}.zip" . && cd ..
+            echo "ARCHIVE=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
+          else
+            tar -czvf "${ARCHIVE_NAME}.tar.gz" -C package .
+            echo "ARCHIVE=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+          fi
+          
+          sha256sum "${{ env.ARCHIVE }}" > "${{ env.ARCHIVE }}.sha256"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            *.tar.gz
+            *.zip
+            *.sha256
+          retention-days: 1
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [prepare, build]
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: release-*
+
+      - name: 整理文件
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.sha256" \) -exec mv {} release/ \;
+          cd release && cat *.sha256 > checksums.txt
+          ls -la
+
+      - name: 生成发布说明
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          cat > release-notes.md << EOF
+          # 🚀 Phantom Server ${TAG}
+          
+          ## ✨ 特性
+          
+          - 🎯 **极简设计** - 约 600 行核心代码
+          - 🔒 **TSKD 认证** - 时间同步密钥派生，0-RTT
+          - 🛡️ **ChaCha20-Poly1305** - 高性能 AEAD 加密
+          - 👻 **抗探测** - 全密文传输，静默丢弃
+          
+          ## 📦 下载
+          
+          | 平台 | 架构 | 下载 |
+          |------|------|------|
+          | Linux | amd64 | [phantom-server-linux-amd64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-linux-amd64.tar.gz) |
+          | Linux | arm64 | [phantom-server-linux-arm64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-linux-arm64.tar.gz) |
+          | Linux | armv7 | [phantom-server-linux-armv7.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-linux-armv7.tar.gz) |
+          | macOS | amd64 | [phantom-server-darwin-amd64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-darwin-amd64.tar.gz) |
+          | macOS | arm64 | [phantom-server-darwin-arm64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-darwin-arm64.tar.gz) |
+          | Windows | amd64 | [phantom-server-windows-amd64.zip](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-windows-amd64.zip) |
+          | FreeBSD | amd64 | [phantom-server-freebsd-amd64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-freebsd-amd64.tar.gz) |
+          
+          ## 🚀 一键安装
+          
+          \`\`\`bash
+          bash <(curl -fsSL https://raw.githubusercontent.com/mrcgq/g1g1/main/scripts/install.sh)
+          \`\`\`
+          
+          ## 📋 校验和
+          
+          <details>
+          <summary>SHA256</summary>
+          
+          \`\`\`
+          $(cat release/checksums.txt)
+          \`\`\`
+          
+          </details>
+          EOF
+
+      - name: 创建 Release
         uses: softprops/action-gh-release@v1
         with:
-          files: release/*
-          generate_release_notes: true
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Phantom Server ${{ needs.prepare.outputs.tag }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.tag, 'alpha') || contains(needs.prepare.outputs.tag, 'beta') }}
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+            release/checksums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

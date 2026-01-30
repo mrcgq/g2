@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -50,7 +51,9 @@ func New(pskBase64 string, timeWindow int) (*Crypto, error) {
 
 	// 派生 UserID
 	reader := hkdf.New(sha256.New, psk, nil, []byte("phantom-userid-v3"))
-	io.ReadFull(reader, c.userID[:])
+	if _, err := io.ReadFull(reader, c.userID[:]); err != nil {
+		return nil, fmt.Errorf("派生 UserID 失败: %w", err)
+	}
 
 	// 启动清理
 	go c.cleanupLoop()
@@ -66,7 +69,10 @@ func (c *Crypto) GetUserID() [UserIDSize]byte {
 // Encrypt 加密数据
 func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 	window := c.currentWindow()
-	aead := c.getAEAD(window)
+	aead, err := c.getAEAD(window)
+	if err != nil {
+		return nil, err
+	}
 
 	nonce := make([]byte, NonceSize)
 	if _, err := rand.Read(nonce); err != nil {
@@ -81,7 +87,7 @@ func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(output[UserIDSize:HeaderSize], timestamp)
 	copy(output[HeaderSize:HeaderSize+NonceSize], nonce)
 
-	// AAD = Header
+	// AAD = Header, Seal 会追加密文到 dst
 	aead.Seal(output[HeaderSize+NonceSize:HeaderSize+NonceSize], nonce, plaintext, output[:HeaderSize])
 
 	return output, nil
@@ -119,7 +125,10 @@ func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 
 	// 尝试多个时间窗口
 	for _, window := range c.validWindows() {
-		aead := c.getAEAD(window)
+		aead, err := c.getAEAD(window)
+		if err != nil {
+			continue
+		}
 		if plaintext, err := aead.Open(nil, nonce, ciphertext, header); err == nil {
 			return plaintext, nil
 		}
@@ -137,9 +146,9 @@ func (c *Crypto) validWindows() []int64 {
 	return []int64{w - 1, w, w + 1}
 }
 
-func (c *Crypto) getAEAD(window int64) *chacha20poly1305.XChaCha20Poly1305 {
+func (c *Crypto) getAEAD(window int64) (cipher.AEAD, error) {
 	if v, ok := c.aeadCache.Load(window); ok {
-		return v.(*chacha20poly1305.XChaCha20Poly1305)
+		return v.(cipher.AEAD), nil
 	}
 
 	// 派生密钥
@@ -147,11 +156,16 @@ func (c *Crypto) getAEAD(window int64) *chacha20poly1305.XChaCha20Poly1305 {
 	binary.BigEndian.PutUint64(salt, uint64(window))
 	reader := hkdf.New(sha256.New, c.psk, salt, []byte("phantom-key-v3"))
 	key := make([]byte, chacha20poly1305.KeySize)
-	io.ReadFull(reader, key)
+	if _, err := io.ReadFull(reader, key); err != nil {
+		return nil, fmt.Errorf("派生密钥失败: %w", err)
+	}
 
-	aead, _ := chacha20poly1305.New(key)
+	aead, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, fmt.Errorf("创建 AEAD 失败: %w", err)
+	}
 	c.aeadCache.Store(window, aead)
-	return aead
+	return aead, nil
 }
 
 func (c *Crypto) validateTimestamp(ts uint16) bool {
@@ -181,7 +195,7 @@ func (c *Crypto) cleanupLoop() {
 
 		// 清理重放缓存
 		c.replayCache.Range(func(key, value interface{}) bool {
-			if t := value.(time.Time); now.Sub(t) > 2*time.Minute {
+			if t, ok := value.(time.Time); ok && now.Sub(t) > 2*time.Minute {
 				c.replayCache.Delete(key)
 			}
 			return true
@@ -189,7 +203,7 @@ func (c *Crypto) cleanupLoop() {
 
 		// 清理 AEAD 缓存
 		c.aeadCache.Range(func(key, value interface{}) bool {
-			if cw-key.(int64) > 2 {
+			if w, ok := key.(int64); ok && cw-w > 2 {
 				c.aeadCache.Delete(key)
 			}
 			return true
