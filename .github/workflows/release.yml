@@ -12,7 +12,7 @@ on:
         type: string
 
 env:
-  GO_VERSION: '1.24'
+  GO_VERSION: '1.24' # 已根据你的环境更新到 1.24
   BINARY_NAME: phantom-server
 
 permissions:
@@ -112,19 +112,24 @@ jobs:
           
           mkdir -p package
           cp "${{ env.BINARY }}" package/
-          cp configs/config.example.yaml package/config.yaml
-          cp README.md package/
-          cp LICENSE package/
+          # 检查文件是否存在再拷贝，避免报错
+          if [ -f configs/config.example.yaml ]; then cp configs/config.example.yaml package/config.yaml; fi
+          if [ -f README.md ]; then cp README.md package/; fi
+          if [ -f LICENSE ]; then cp LICENSE package/; fi
           
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            cd package && zip -r "../${ARCHIVE_NAME}.zip" . && cd ..
-            echo "ARCHIVE=${ARCHIVE_NAME}.zip" >> $GITHUB_ENV
+            FILE_NAME="${ARCHIVE_NAME}.zip"
+            cd package && zip -r "../$FILE_NAME" . && cd ..
           else
-            tar -czvf "${ARCHIVE_NAME}.tar.gz" -C package .
-            echo "ARCHIVE=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_ENV
+            FILE_NAME="${ARCHIVE_NAME}.tar.gz"
+            tar -czvf "$FILE_NAME" -C package .
           fi
           
-          sha256sum "${{ env.ARCHIVE }}" > "${{ env.ARCHIVE }}.sha256"
+          # 修正这里：直接使用 Shell 变量 FILE_NAME，而不是 GitHub 上下文
+          sha256sum "$FILE_NAME" > "$FILE_NAME.sha256"
+          
+          # 传递给后续步骤
+          echo "ARCHIVE=$FILE_NAME" >> $GITHUB_ENV
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -174,19 +179,13 @@ jobs:
           
           | 平台 | 架构 | 下载 |
           |------|------|------|
-          | Linux | amd64 | [phantom-server-linux-amd64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-linux-amd64.tar.gz) |
-          | Linux | arm64 | [phantom-server-linux-arm64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-linux-arm64.tar.gz) |
-          | Linux | armv7 | [phantom-server-linux-armv7.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-linux-armv7.tar.gz) |
-          | macOS | amd64 | [phantom-server-darwin-amd64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-darwin-amd64.tar.gz) |
-          | macOS | arm64 | [phantom-server-darwin-arm64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-darwin-arm64.tar.gz) |
-          | Windows | amd64 | [phantom-server-windows-amd64.zip](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-windows-amd64.zip) |
-          | FreeBSD | amd64 | [phantom-server-freebsd-amd64.tar.gz](https://github.com/mrcgq/g1g1/releases/download/${TAG}/phantom-server-freebsd-amd64.tar.gz) |
-          
-          ## 🚀 一键安装
-          
-          \`\`\`bash
-          bash <(curl -fsSL https://raw.githubusercontent.com/mrcgq/g1g1/main/scripts/install.sh)
-          \`\`\`
+          | Linux | amd64 | [phantom-server-linux-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-linux-amd64.tar.gz) |
+          | Linux | arm64 | [phantom-server-linux-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-linux-arm64.tar.gz) |
+          | Linux | armv7 | [phantom-server-linux-armv7.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-linux-armv7.tar.gz) |
+          | macOS | amd64 | [phantom-server-darwin-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-darwin-amd64.tar.gz) |
+          | macOS | arm64 | [phantom-server-darwin-arm64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-darwin-arm64.tar.gz) |
+          | Windows | amd64 | [phantom-server-windows-amd64.zip](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-windows-amd64.zip) |
+          | FreeBSD | amd64 | [phantom-server-freebsd-amd64.tar.gz](https://github.com/${{ github.repository }}/releases/download/${TAG}/phantom-server-freebsd-amd64.tar.gz) |
           
           ## 📋 校验和
           
