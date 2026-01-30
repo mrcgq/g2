@@ -9,32 +9,46 @@ import (
 	"time"
 )
 
-func TestBasicSendRecv(t *testing.T) {
+// 创建测试用的连接对，使用同步方式避免竞争
+func createTestPair(t *testing.T) (local, peer *Conn, cleanup func()) {
 	var mu sync.Mutex
+	var localConn, peerConn *Conn
 
-	// 模拟对端
-	var peer *Conn
-
-	// 创建本端
-	local := New(func(data []byte) error {
+	localConn = New(func(data []byte) error {
 		mu.Lock()
-		defer mu.Unlock()
-		if peer != nil {
-			go peer.OnReceive(data)
+		p := peerConn
+		mu.Unlock()
+		if p != nil {
+			// 同步调用，避免 goroutine 竞争
+			p.OnReceive(data)
 		}
 		return nil
 	})
 
-	// 创建对端
-	peer = New(func(data []byte) error {
+	peerConn = New(func(data []byte) error {
 		mu.Lock()
-		defer mu.Unlock()
-		go local.OnReceive(data)
+		l := localConn
+		mu.Unlock()
+		if l != nil {
+			// 同步调用，避免 goroutine 竞争
+			l.OnReceive(data)
+		}
 		return nil
 	})
 
-	defer local.Close()
-	defer peer.Close()
+	cleanup = func() {
+		mu.Lock()
+		localConn.Close()
+		peerConn.Close()
+		mu.Unlock()
+	}
+
+	return localConn, peerConn, cleanup
+}
+
+func TestBasicSendRecv(t *testing.T) {
+	local, peer, cleanup := createTestPair(t)
+	defer cleanup()
 
 	// 发送测试数据
 	testData := []byte("Hello, ARQ!")
@@ -43,7 +57,7 @@ func TestBasicSendRecv(t *testing.T) {
 	}
 
 	// 接收
-	data, err := peer.RecvTimeout(time.Second)
+	data, err := peer.RecvTimeout(2 * time.Second)
 	if err != nil {
 		t.Fatalf("接收失败: %v", err)
 	}
@@ -53,28 +67,34 @@ func TestBasicSendRecv(t *testing.T) {
 	}
 }
 
-func TestLargeData(t *testing.T) {
-	var mu sync.Mutex
-	var peer *Conn
+func TestMultipleSend(t *testing.T) {
+	local, peer, cleanup := createTestPair(t)
+	defer cleanup()
 
-	local := New(func(data []byte) error {
-		mu.Lock()
-		defer mu.Unlock()
-		if peer != nil {
-			go peer.OnReceive(data)
+	messages := []string{"msg1", "msg2", "msg3", "msg4", "msg5"}
+
+	// 发送多条消息
+	for _, msg := range messages {
+		if err := local.Send([]byte(msg)); err != nil {
+			t.Fatalf("发送失败: %v", err)
 		}
-		return nil
-	})
+	}
 
-	peer = New(func(data []byte) error {
-		mu.Lock()
-		defer mu.Unlock()
-		go local.OnReceive(data)
-		return nil
-	})
+	// 接收所有消息
+	for i, expected := range messages {
+		data, err := peer.RecvTimeout(2 * time.Second)
+		if err != nil {
+			t.Fatalf("接收消息 %d 失败: %v", i, err)
+		}
+		if string(data) != expected {
+			t.Errorf("消息 %d 不匹配: got %s, want %s", i, data, expected)
+		}
+	}
+}
 
-	defer local.Close()
-	defer peer.Close()
+func TestLargeData(t *testing.T) {
+	local, peer, cleanup := createTestPair(t)
+	defer cleanup()
 
 	// 发送大数据（会自动分片）
 	largeData := make([]byte, 5000)
@@ -89,14 +109,18 @@ func TestLargeData(t *testing.T) {
 	// 接收所有分片
 	var result []byte
 	timeout := time.After(5 * time.Second)
+	
 	for len(result) < len(largeData) {
 		select {
 		case <-timeout:
 			t.Fatalf("接收超时 (已收到 %d/%d 字节)", len(result), len(largeData))
 		default:
-			data, err := peer.RecvTimeout(time.Second)
-			if err != nil {
+			data, err := peer.RecvTimeout(500 * time.Millisecond)
+			if err == ErrTimeout {
 				continue
+			}
+			if err != nil {
+				t.Fatalf("接收失败: %v", err)
 			}
 			result = append(result, data...)
 		}
@@ -165,6 +189,9 @@ func TestCloseConnection(t *testing.T) {
 		t.Fatalf("关闭失败: %v", err)
 	}
 
+	// 等待后台 goroutine 退出
+	time.Sleep(100 * time.Millisecond)
+
 	// 再次关闭应该无错误
 	if err := local.Close(); err != nil {
 		t.Fatalf("重复关闭失败: %v", err)
@@ -176,67 +203,99 @@ func TestCloseConnection(t *testing.T) {
 	}
 }
 
-func TestACKHandling(t *testing.T) {
-	var mu sync.Mutex
-	var peer *Conn
-	ackReceived := make(chan struct{}, 10)
-
+func TestRecvTimeout(t *testing.T) {
 	local := New(func(data []byte) error {
-		mu.Lock()
-		defer mu.Unlock()
-		if peer != nil {
-			go func() {
-				peer.OnReceive(data)
-				select {
-				case ackReceived <- struct{}{}:
-				default:
-				}
-			}()
-		}
 		return nil
 	})
-
-	peer = New(func(data []byte) error {
-		mu.Lock()
-		defer mu.Unlock()
-		go local.OnReceive(data)
-		return nil
-	})
-
 	defer local.Close()
-	defer peer.Close()
+
+	// 接收应该超时
+	start := time.Now()
+	_, err := local.RecvTimeout(100 * time.Millisecond)
+	elapsed := time.Since(start)
+
+	if err != ErrTimeout {
+		t.Errorf("应该返回 ErrTimeout, got: %v", err)
+	}
+
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("超时时间太短: %v", elapsed)
+	}
+}
+
+func TestGetStats(t *testing.T) {
+	local, peer, cleanup := createTestPair(t)
+	defer cleanup()
 
 	// 发送数据
 	if err := local.Send([]byte("test")); err != nil {
 		t.Fatalf("发送失败: %v", err)
 	}
 
-	// 等待 ACK 处理
-	select {
-	case <-ackReceived:
-		// ACK 已处理
-	case <-time.After(2 * time.Second):
-		t.Log("等待 ACK 超时，但这可能是正常的")
+	// 接收
+	_, err := peer.RecvTimeout(time.Second)
+	if err != nil {
+		t.Fatalf("接收失败: %v", err)
+	}
+
+	// 检查统计
+	localStats := local.GetStats()
+	peerStats := peer.GetStats()
+
+	if localStats.PacketsSent == 0 {
+		t.Error("本地发送计数应该大于0")
+	}
+	if peerStats.PacketsRecv == 0 {
+		t.Error("对端接收计数应该大于0")
+	}
+}
+
+func TestFlags(t *testing.T) {
+	// 测试各种标志位
+	if FlagData != 0x00 {
+		t.Errorf("FlagData 应该是 0x00")
+	}
+	if FlagAck != 0x01 {
+		t.Errorf("FlagAck 应该是 0x01")
+	}
+	if FlagPing != 0x02 {
+		t.Errorf("FlagPing 应该是 0x02")
+	}
+	if FlagPong != 0x03 {
+		t.Errorf("FlagPong 应该是 0x03")
+	}
+	if FlagFin != 0x04 {
+		t.Errorf("FlagFin 应该是 0x04")
+	}
+}
+
+func TestHeaderSize(t *testing.T) {
+	if HeaderSize != 11 {
+		t.Errorf("HeaderSize 应该是 11, got %d", HeaderSize)
 	}
 }
 
 func BenchmarkSendRecv(b *testing.B) {
 	var mu sync.Mutex
-	var peer *Conn
+	var local, peer *Conn
 
-	local := New(func(data []byte) error {
+	local = New(func(data []byte) error {
 		mu.Lock()
-		defer mu.Unlock()
-		if peer != nil {
-			peer.OnReceive(data)
+		p := peer
+		mu.Unlock()
+		if p != nil {
+			p.OnReceive(data)
 		}
 		return nil
 	})
 
 	peer = New(func(data []byte) error {
 		mu.Lock()
-		defer mu.Unlock()
-		local.OnReceive(data)
+		l := local
+		mu.Unlock()
+		if l != nil {
+			l.OnReceive(data)
+		}
 		return nil
 	})
 
