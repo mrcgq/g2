@@ -23,7 +23,14 @@ type Conn struct {
 	ClientAddr *net.UDPAddr
 	Network    string
 	LastActive time.Time
-	ARQ        *arq.Conn // 新增：ARQ 连接
+	mu         sync.Mutex
+}
+
+// ClientSession 客户端会话（按地址）
+type ClientSession struct {
+	Addr       *net.UDPAddr
+	ARQ        *arq.Conn
+	LastActive time.Time
 	mu         sync.Mutex
 }
 
@@ -32,8 +39,9 @@ type Handler struct {
 	crypto   *crypto.Crypto
 	logLevel int
 
-	sender SendFunc
-	conns  sync.Map // reqID -> *Conn
+	sender   SendFunc
+	conns    sync.Map // reqID -> *Conn
+	sessions sync.Map // clientAddr string -> *ClientSession
 }
 
 const (
@@ -67,76 +75,27 @@ func (h *Handler) SetSender(fn SendFunc) {
 	h.sender = fn
 }
 
-// HandlePacket 处理数据包
-func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
-	// 解密
-	plaintext, err := h.crypto.Decrypt(data)
-	if err != nil {
-		h.log(logDebug, "解密失败: %v", err)
-		return nil // 静默丢弃
+// getOrCreateSession 获取或创建客户端会话
+func (h *Handler) getOrCreateSession(from *net.UDPAddr) *ClientSession {
+	key := from.String()
+
+	if v, ok := h.sessions.Load(key); ok {
+		session := v.(*ClientSession)
+		session.mu.Lock()
+		session.LastActive = time.Now()
+		session.mu.Unlock()
+		return session
 	}
 
-	// 首先检查是否是 ARQ 控制包（通过检查已有连接）
-	if len(plaintext) >= arq.HeaderSize {
-		if handled := h.tryHandleARQ(plaintext, from); handled {
-			return nil
-		}
+	// 创建新会话
+	session := &ClientSession{
+		Addr:       from,
+		LastActive: time.Now(),
 	}
 
-	// 解析为协议请求
-	req, err := protocol.ParseRequest(plaintext)
-	if err != nil {
-		h.log(logDebug, "解析失败: %v", err)
-		return nil
-	}
-
-	// 处理
-	switch req.Type {
-	case protocol.TypeConnect:
-		return h.handleConnect(req, from)
-	case protocol.TypeData:
-		return h.handleData(req, from)
-	case protocol.TypeClose:
-		return h.handleClose(req)
-	default:
-		return nil
-	}
-}
-
-// tryHandleARQ 尝试处理 ARQ 包
-func (h *Handler) tryHandleARQ(data []byte, from *net.UDPAddr) bool {
-	// 遍历所有连接，尝试让其 ARQ 处理这个包
-	handled := false
-	h.conns.Range(func(key, value interface{}) bool {
-		c := value.(*Conn)
-		c.mu.Lock()
-		if c.ARQ != nil && c.ClientAddr.String() == from.String() {
-			if err := c.ARQ.OnReceive(data); err == nil {
-				c.LastActive = time.Now()
-				handled = true
-			}
-		}
-		c.mu.Unlock()
-		return !handled // 如果处理成功就停止遍历
-	})
-	return handled
-}
-
-func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte {
-	network := req.NetworkString()
-	target := req.TargetAddr()
-
-	h.log(logInfo, "连接: %s %s (ID:%d)", network, target, req.ReqID)
-
-	// 建立连接
-	conn, err := net.DialTimeout(network, target, 10*time.Second)
-	if err != nil {
-		h.log(logDebug, "连接失败: %s - %v", target, err)
-		return h.response(req.ReqID, 0x01, nil, from) // 失败
-	}
-
-	// 创建 ARQ 连接
-	arqConn := arq.New(func(data []byte) error {
+	// 创建该客户端的全局 ARQ
+	session.ARQ = arq.New(func(data []byte) error {
+		// ARQ 输出 -> 加密 -> 发送
 		encrypted, err := h.crypto.Encrypt(data)
 		if err != nil {
 			return err
@@ -147,6 +106,87 @@ func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte
 		return nil
 	})
 
+	// 启动 ARQ 数据处理协程
+	go h.processARQData(session)
+
+	h.sessions.Store(key, session)
+	h.log(logDebug, "创建客户端会话: %s", key)
+
+	return session
+}
+
+// processARQData 处理 ARQ 输出的数据
+func (h *Handler) processARQData(session *ClientSession) {
+	for {
+		data, err := session.ARQ.RecvTimeout(time.Second)
+		if err != nil {
+			if err == arq.ErrTimeout {
+				continue
+			}
+			if err == arq.ErrClosed {
+				return
+			}
+			continue
+		}
+
+		// 解析协议
+		h.handleProtocolData(data, session.Addr)
+	}
+}
+
+// handleProtocolData 处理协议数据
+func (h *Handler) handleProtocolData(data []byte, from *net.UDPAddr) {
+	req, err := protocol.ParseRequest(data)
+	if err != nil {
+		h.log(logDebug, "解析失败: %v", err)
+		return
+	}
+
+	switch req.Type {
+	case protocol.TypeConnect:
+		h.handleConnect(req, from)
+	case protocol.TypeData:
+		h.handleData(req)
+	case protocol.TypeClose:
+		h.handleClose(req)
+	}
+}
+
+// HandlePacket 处理数据包（入口）
+func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
+	// 解密
+	plaintext, err := h.crypto.Decrypt(data)
+	if err != nil {
+		h.log(logDebug, "解密失败: %v", err)
+		return nil // 静默丢弃
+	}
+
+	// 获取或创建该客户端的会话
+	session := h.getOrCreateSession(from)
+
+	// 把数据交给该客户端的 ARQ 处理
+	if err := session.ARQ.OnReceive(plaintext); err != nil {
+		h.log(logDebug, "ARQ 处理失败: %v", err)
+	}
+
+	// 返回 nil，响应通过 ARQ 异步发送
+	return nil
+}
+
+func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) {
+	network := req.NetworkString()
+	target := req.TargetAddr()
+
+	h.log(logInfo, "连接: %s %s (ID:%d)", network, target, req.ReqID)
+
+	// 建立连接
+	conn, err := net.DialTimeout(network, target, 10*time.Second)
+	if err != nil {
+		h.log(logDebug, "连接失败: %s - %v", target, err)
+		h.sendResponse(req.ReqID, 0x01, nil, from) // 失败
+		return
+	}
+
 	// 保存连接
 	c := &Conn{
 		ID:         req.ReqID,
@@ -154,7 +194,6 @@ func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte
 		ClientAddr: from,
 		Network:    network,
 		LastActive: time.Now(),
-		ARQ:        arqConn,
 	}
 	h.conns.Store(req.ReqID, c)
 
@@ -164,16 +203,17 @@ func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte
 		_, _ = conn.Write(req.Data)
 	}
 
+	// 发送成功响应
+	h.sendResponse(req.ReqID, 0x00, nil, from)
+
 	// 启动读取循环
 	go h.readLoop(c)
-
-	return h.response(req.ReqID, 0x00, nil, from) // 成功
 }
 
-func (h *Handler) handleData(req *protocol.Request, from *net.UDPAddr) []byte {
+func (h *Handler) handleData(req *protocol.Request) {
 	v, ok := h.conns.Load(req.ReqID)
 	if !ok {
-		return nil
+		return
 	}
 
 	c := v.(*Conn)
@@ -187,13 +227,10 @@ func (h *Handler) handleData(req *protocol.Request, from *net.UDPAddr) []byte {
 			h.closeConn(req.ReqID)
 		}
 	}
-
-	return nil
 }
 
-func (h *Handler) handleClose(req *protocol.Request) []byte {
+func (h *Handler) handleClose(req *protocol.Request) {
 	h.closeConn(req.ReqID)
-	return nil
 }
 
 func (h *Handler) readLoop(c *Conn) {
@@ -213,43 +250,41 @@ func (h *Handler) readLoop(c *Conn) {
 
 		c.mu.Lock()
 		c.LastActive = time.Now()
-		arqConn := c.ARQ
+		addr := c.ClientAddr
 		c.mu.Unlock()
 
-		// 通过 ARQ 发送响应
-		if arqConn != nil {
-			resp := protocol.BuildResponse(c.ID, protocol.TypeData, buf[:n])
-			if err := arqConn.Send(resp); err != nil {
-				h.log(logDebug, "ARQ 发送失败: ID:%d - %v", c.ID, err)
-				return
-			}
-		}
+		// 发送响应
+		h.sendResponse(c.ID, protocol.TypeData, buf[:n], addr)
 	}
 }
 
-func (h *Handler) response(reqID uint32, status byte, data []byte, from *net.UDPAddr) []byte {
-	plain := protocol.BuildResponse(reqID, status, data)
-
-	// 对于连接响应，直接加密返回（不经过 ARQ，因为这是握手响应）
-	// 后续数据会通过 ARQ 发送
-	encrypted, err := h.crypto.Encrypt(plain)
-	if err != nil {
-		return nil
+// sendResponse 通过 ARQ 发送响应
+func (h *Handler) sendResponse(reqID uint32, status byte, data []byte, to *net.UDPAddr) {
+	// 获取客户端会话
+	key := to.String()
+	v, ok := h.sessions.Load(key)
+	if !ok {
+		h.log(logDebug, "会话不存在: %s", key)
+		return
 	}
-	return encrypted
+
+	session := v.(*ClientSession)
+
+	// 构建响应
+	resp := protocol.BuildResponse(reqID, status, data)
+
+	// 通过 ARQ 发送
+	if err := session.ARQ.Send(resp); err != nil {
+		h.log(logDebug, "ARQ 发送失败: %v", err)
+	}
 }
 
 func (h *Handler) closeConn(reqID uint32) {
 	if v, ok := h.conns.LoadAndDelete(reqID); ok {
 		c := v.(*Conn)
-		c.mu.Lock()
 		if c.Target != nil {
 			_ = c.Target.Close()
 		}
-		if c.ARQ != nil {
-			_ = c.ARQ.Close()
-		}
-		c.mu.Unlock()
 		h.log(logInfo, "断开: ID:%d", reqID)
 	}
 }
@@ -260,6 +295,8 @@ func (h *Handler) cleanup() {
 
 	for range ticker.C {
 		now := time.Now()
+
+		// 清理超时连接
 		h.conns.Range(func(key, value interface{}) bool {
 			c := value.(*Conn)
 			c.mu.Lock()
@@ -267,6 +304,20 @@ func (h *Handler) cleanup() {
 			c.mu.Unlock()
 			if idle > 5*time.Minute {
 				h.closeConn(key.(uint32))
+			}
+			return true
+		})
+
+		// 清理超时会话
+		h.sessions.Range(func(key, value interface{}) bool {
+			session := value.(*ClientSession)
+			session.mu.Lock()
+			idle := now.Sub(session.LastActive)
+			session.mu.Unlock()
+			if idle > 10*time.Minute {
+				session.ARQ.Close()
+				h.sessions.Delete(key)
+				h.log(logDebug, "清理客户端会话: %s", key)
 			}
 			return true
 		})
