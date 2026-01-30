@@ -1,3 +1,4 @@
+// internal/handler/handler.go
 package handler
 
 import (
@@ -7,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/anthropics/phantom-server/internal/arq"
 	"github.com/anthropics/phantom-server/internal/crypto"
 	"github.com/anthropics/phantom-server/internal/protocol"
 )
@@ -21,6 +23,7 @@ type Conn struct {
 	ClientAddr *net.UDPAddr
 	Network    string
 	LastActive time.Time
+	ARQ        *arq.Conn // 新增：ARQ 连接
 	mu         sync.Mutex
 }
 
@@ -73,7 +76,14 @@ func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
 		return nil // 静默丢弃
 	}
 
-	// 解析
+	// 首先检查是否是 ARQ 控制包（通过检查已有连接）
+	if len(plaintext) >= arq.HeaderSize {
+		if handled := h.tryHandleARQ(plaintext, from); handled {
+			return nil
+		}
+	}
+
+	// 解析为协议请求
 	req, err := protocol.ParseRequest(plaintext)
 	if err != nil {
 		h.log(logDebug, "解析失败: %v", err)
@@ -85,12 +95,31 @@ func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
 	case protocol.TypeConnect:
 		return h.handleConnect(req, from)
 	case protocol.TypeData:
-		return h.handleData(req)
+		return h.handleData(req, from)
 	case protocol.TypeClose:
 		return h.handleClose(req)
 	default:
 		return nil
 	}
+}
+
+// tryHandleARQ 尝试处理 ARQ 包
+func (h *Handler) tryHandleARQ(data []byte, from *net.UDPAddr) bool {
+	// 遍历所有连接，尝试让其 ARQ 处理这个包
+	handled := false
+	h.conns.Range(func(key, value interface{}) bool {
+		c := value.(*Conn)
+		c.mu.Lock()
+		if c.ARQ != nil && c.ClientAddr.String() == from.String() {
+			if err := c.ARQ.OnReceive(data); err == nil {
+				c.LastActive = time.Now()
+				handled = true
+			}
+		}
+		c.mu.Unlock()
+		return !handled // 如果处理成功就停止遍历
+	})
+	return handled
 }
 
 func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte {
@@ -103,8 +132,20 @@ func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte
 	conn, err := net.DialTimeout(network, target, 10*time.Second)
 	if err != nil {
 		h.log(logDebug, "连接失败: %s - %v", target, err)
-		return h.response(req.ReqID, 0x01, nil) // 失败
+		return h.response(req.ReqID, 0x01, nil, from) // 失败
 	}
+
+	// 创建 ARQ 连接
+	arqConn := arq.New(func(data []byte) error {
+		encrypted, err := h.crypto.Encrypt(data)
+		if err != nil {
+			return err
+		}
+		if h.sender != nil {
+			return h.sender(encrypted, from)
+		}
+		return nil
+	})
 
 	// 保存连接
 	c := &Conn{
@@ -113,6 +154,7 @@ func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte
 		ClientAddr: from,
 		Network:    network,
 		LastActive: time.Now(),
+		ARQ:        arqConn,
 	}
 	h.conns.Store(req.ReqID, c)
 
@@ -125,10 +167,10 @@ func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte
 	// 启动读取循环
 	go h.readLoop(c)
 
-	return h.response(req.ReqID, 0x00, nil) // 成功
+	return h.response(req.ReqID, 0x00, nil, from) // 成功
 }
 
-func (h *Handler) handleData(req *protocol.Request) []byte {
+func (h *Handler) handleData(req *protocol.Request, from *net.UDPAddr) []byte {
 	v, ok := h.conns.Load(req.ReqID)
 	if !ok {
 		return nil
@@ -151,7 +193,7 @@ func (h *Handler) handleData(req *protocol.Request) []byte {
 
 func (h *Handler) handleClose(req *protocol.Request) []byte {
 	h.closeConn(req.ReqID)
-	return h.response(req.ReqID, 0x00, nil)
+	return nil
 }
 
 func (h *Handler) readLoop(c *Conn) {
@@ -171,19 +213,25 @@ func (h *Handler) readLoop(c *Conn) {
 
 		c.mu.Lock()
 		c.LastActive = time.Now()
-		addr := c.ClientAddr
+		arqConn := c.ARQ
 		c.mu.Unlock()
 
-		// 发送响应
-		resp := h.response(c.ID, protocol.TypeData, buf[:n])
-		if resp != nil && h.sender != nil && addr != nil {
-			_ = h.sender(resp, addr)
+		// 通过 ARQ 发送响应
+		if arqConn != nil {
+			resp := protocol.BuildResponse(c.ID, protocol.TypeData, buf[:n])
+			if err := arqConn.Send(resp); err != nil {
+				h.log(logDebug, "ARQ 发送失败: ID:%d - %v", c.ID, err)
+				return
+			}
 		}
 	}
 }
 
-func (h *Handler) response(reqID uint32, status byte, data []byte) []byte {
+func (h *Handler) response(reqID uint32, status byte, data []byte, from *net.UDPAddr) []byte {
 	plain := protocol.BuildResponse(reqID, status, data)
+
+	// 对于连接响应，直接加密返回（不经过 ARQ，因为这是握手响应）
+	// 后续数据会通过 ARQ 发送
 	encrypted, err := h.crypto.Encrypt(plain)
 	if err != nil {
 		return nil
@@ -194,9 +242,14 @@ func (h *Handler) response(reqID uint32, status byte, data []byte) []byte {
 func (h *Handler) closeConn(reqID uint32) {
 	if v, ok := h.conns.LoadAndDelete(reqID); ok {
 		c := v.(*Conn)
+		c.mu.Lock()
 		if c.Target != nil {
 			_ = c.Target.Close()
 		}
+		if c.ARQ != nil {
+			_ = c.ARQ.Close()
+		}
+		c.mu.Unlock()
 		h.log(logInfo, "断开: ID:%d", reqID)
 	}
 }
