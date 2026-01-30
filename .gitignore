@@ -1,0 +1,40 @@
+gitignore
+# 二进制
+phantom-server
+phantom-server-*
+*.exe
+
+# 构建目录
+/bin/
+/dist/
+/release/
+
+# 测试
+coverage.out
+*.test
+*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 配置（包含敏感信息）
+config.yaml
+!configs/config.example.yaml
+
+# 日志
+*.log
+logs/
+
+# 临时
+/tmp/
+*.tmp
+
+
