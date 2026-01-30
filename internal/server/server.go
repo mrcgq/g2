@@ -54,9 +54,9 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("监听失败: %w", err)
 	}
 
-	// 优化缓冲区
-	s.conn.SetReadBuffer(4 * 1024 * 1024)
-	s.conn.SetWriteBuffer(4 * 1024 * 1024)
+	// 优化缓冲区（忽略错误，非关键）
+	_ = s.conn.SetReadBuffer(4 * 1024 * 1024)
+	_ = s.conn.SetWriteBuffer(4 * 1024 * 1024)
 
 	// 启动工作协程
 	workers := 4
@@ -82,7 +82,7 @@ func (s *Server) worker(ctx context.Context) {
 		default:
 		}
 
-		s.conn.SetReadDeadline(time.Now().Add(time.Second))
+		_ = s.conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -107,7 +107,7 @@ func (s *Server) worker(ctx context.Context) {
 		// 异步处理
 		go func(d []byte, a *net.UDPAddr) {
 			if resp := s.handler.HandlePacket(d, a); resp != nil {
-				s.conn.WriteToUDP(resp, a)
+				_, _ = s.conn.WriteToUDP(resp, a)
 			}
 		}(data, addr)
 	}
