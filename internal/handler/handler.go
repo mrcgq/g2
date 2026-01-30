@@ -118,8 +118,8 @@ func (h *Handler) handleConnect(req *protocol.Request, from *net.UDPAddr) []byte
 
 	// 如果有初始数据，发送
 	if len(req.Data) > 0 {
-		conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		conn.Write(req.Data)
+		_ = conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_, _ = conn.Write(req.Data)
 	}
 
 	// 启动读取循环
@@ -140,7 +140,7 @@ func (h *Handler) handleData(req *protocol.Request) []byte {
 	c.mu.Unlock()
 
 	if len(req.Data) > 0 {
-		c.Target.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		_ = c.Target.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if _, err := c.Target.Write(req.Data); err != nil {
 			h.closeConn(req.ReqID)
 		}
@@ -160,7 +160,7 @@ func (h *Handler) readLoop(c *Conn) {
 	buf := make([]byte, 32*1024)
 
 	for {
-		c.Target.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		_ = c.Target.SetReadDeadline(time.Now().Add(5 * time.Minute))
 		n, err := c.Target.Read(buf)
 		if err != nil {
 			if err != io.EOF {
@@ -177,7 +177,7 @@ func (h *Handler) readLoop(c *Conn) {
 		// 发送响应
 		resp := h.response(c.ID, protocol.TypeData, buf[:n])
 		if resp != nil && h.sender != nil && addr != nil {
-			h.sender(resp, addr)
+			_ = h.sender(resp, addr)
 		}
 	}
 }
@@ -194,7 +194,9 @@ func (h *Handler) response(reqID uint32, status byte, data []byte) []byte {
 func (h *Handler) closeConn(reqID uint32) {
 	if v, ok := h.conns.LoadAndDelete(reqID); ok {
 		c := v.(*Conn)
-		c.Target.Close()
+		if c.Target != nil {
+			_ = c.Target.Close()
+		}
 		h.log(logInfo, "断开: ID:%d", reqID)
 	}
 }
