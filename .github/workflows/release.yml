@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  GO_VERSION: '1.21'
+  BINARY_NAME: phantom-server
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build All Platforms
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u '+%Y-%m-%d %H:%M:%S')
+          LDFLAGS="-s -w -X 'main.Version=${VERSION}' -X 'main.BuildTime=${DATE}' -X 'main.GitCommit=${COMMIT}'"
+          
+          mkdir -p release
+          
+          platforms=("linux/amd64" "linux/arm64" "linux/arm/7" "darwin/amd64" "darwin/arm64" "freebsd/amd64")
+          
+          for platform in "${platforms[@]}"; do
+            IFS='/' read -r GOOS GOARCH GOARM <<< "$platform"
+            output="${{ env.BINARY_NAME }}-${GOOS}-${GOARCH}"
+            [[ -n "$GOARM" ]] && output="${{ env.BINARY_NAME }}-${GOOS}-armv${GOARM}"
+            
+            GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM CGO_ENABLED=0 \
+              go build -trimpath -ldflags "$LDFLAGS" -o "release/${output}" ./cmd/phantom-server
+            
+            tar -czf "release/${output}.tar.gz" -C release "${output}" 
+            rm "release/${output}"
+          done
+          
+          cd release && sha256sum *.tar.gz > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
