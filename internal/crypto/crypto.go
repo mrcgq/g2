@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -81,7 +82,7 @@ func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 	binary.BigEndian.PutUint16(output[UserIDSize:HeaderSize], timestamp)
 	copy(output[HeaderSize:HeaderSize+NonceSize], nonce)
 
-	// AAD = Header
+	// AAD = Header, Seal 会追加密文到 dst
 	aead.Seal(output[HeaderSize+NonceSize:HeaderSize+NonceSize], nonce, plaintext, output[:HeaderSize])
 
 	return output, nil
@@ -137,9 +138,9 @@ func (c *Crypto) validWindows() []int64 {
 	return []int64{w - 1, w, w + 1}
 }
 
-func (c *Crypto) getAEAD(window int64) *chacha20poly1305.XChaCha20Poly1305 {
+func (c *Crypto) getAEAD(window int64) cipher.AEAD {
 	if v, ok := c.aeadCache.Load(window); ok {
-		return v.(*chacha20poly1305.XChaCha20Poly1305)
+		return v.(cipher.AEAD)
 	}
 
 	// 派生密钥
@@ -181,7 +182,7 @@ func (c *Crypto) cleanupLoop() {
 
 		// 清理重放缓存
 		c.replayCache.Range(func(key, value interface{}) bool {
-			if t := value.(time.Time); now.Sub(t) > 2*time.Minute {
+			if t, ok := value.(time.Time); ok && now.Sub(t) > 2*time.Minute {
 				c.replayCache.Delete(key)
 			}
 			return true
@@ -189,7 +190,7 @@ func (c *Crypto) cleanupLoop() {
 
 		// 清理 AEAD 缓存
 		c.aeadCache.Range(func(key, value interface{}) bool {
-			if cw-key.(int64) > 2 {
+			if w, ok := key.(int64); ok && cw-w > 2 {
 				c.aeadCache.Delete(key)
 			}
 			return true
