@@ -1,3 +1,4 @@
+// internal/crypto/crypto.go
 package crypto
 
 import (
@@ -30,8 +31,13 @@ type Crypto struct {
 	userID     [UserIDSize]byte
 	timeWindow int
 
-	aeadCache   sync.Map // window -> cipher.AEAD
-	replayCache sync.Map // nonce -> time.Time
+	aeadCache sync.Map // window -> cipher.AEAD
+
+	// 改进：分离接收和发送的 Nonce 缓存
+	recvNonceCache sync.Map // 接收到的 nonce -> time.Time
+	sendNonceCache sync.Map // 发送过的 nonce -> time.Time
+
+	mu sync.RWMutex
 }
 
 // New 创建加密器
@@ -74,9 +80,21 @@ func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	// 生成唯一 Nonce
 	nonce := make([]byte, NonceSize)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	for attempts := 0; attempts < 10; attempts++ {
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
+		
+		// 确保这个 nonce 没有被发送过
+		nonceKey := string(nonce)
+		if _, exists := c.sendNonceCache.LoadOrStore(nonceKey, time.Now()); !exists {
+			break // 找到了唯一的 nonce
+		}
+		if attempts == 9 {
+			return nil, fmt.Errorf("无法生成唯一 Nonce")
+		}
 	}
 
 	timestamp := uint16(time.Now().Unix() & 0xFFFF)
@@ -113,10 +131,11 @@ func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("时间戳无效")
 	}
 
-	// 重放检查
 	nonce := data[HeaderSize : HeaderSize+NonceSize]
 	nonceKey := string(nonce)
-	if _, exists := c.replayCache.LoadOrStore(nonceKey, time.Now()); exists {
+
+	// 重放检查：只检查接收缓存
+	if _, exists := c.recvNonceCache.Load(nonceKey); exists {
 		return nil, fmt.Errorf("重放攻击")
 	}
 
@@ -130,6 +149,8 @@ func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 			continue
 		}
 		if plaintext, err := aead.Open(nil, nonce, ciphertext, header); err == nil {
+			// 解密成功后才记录 nonce
+			c.recvNonceCache.Store(nonceKey, time.Now())
 			return plaintext, nil
 		}
 	}
@@ -192,11 +213,20 @@ func (c *Crypto) cleanupLoop() {
 	for range ticker.C {
 		now := time.Now()
 		cw := c.currentWindow()
+		expireTime := 2 * time.Minute
 
-		// 清理重放缓存
-		c.replayCache.Range(func(key, value interface{}) bool {
-			if t, ok := value.(time.Time); ok && now.Sub(t) > 2*time.Minute {
-				c.replayCache.Delete(key)
+		// 清理接收 nonce 缓存
+		c.recvNonceCache.Range(func(key, value interface{}) bool {
+			if t, ok := value.(time.Time); ok && now.Sub(t) > expireTime {
+				c.recvNonceCache.Delete(key)
+			}
+			return true
+		})
+
+		// 清理发送 nonce 缓存
+		c.sendNonceCache.Range(func(key, value interface{}) bool {
+			if t, ok := value.(time.Time); ok && now.Sub(t) > expireTime {
+				c.sendNonceCache.Delete(key)
 			}
 			return true
 		})
