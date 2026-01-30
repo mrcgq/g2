@@ -6,7 +6,7 @@
 set -e
 
 # --- 修改部分开始 ---
-VERSION="1.0.4"                  # 必须和你 release 的 tag 一致 (不带 v)
+VERSION="1.0.5"                  # 必须和你 release 的 tag 一致 (不带 v)
 GITHUB_REPO="mrcgq/g2"           # 你的仓库地址
 # --- 修改部分结束 ---
 
