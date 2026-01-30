@@ -1,3 +1,4 @@
+// internal/protocol/protocol.go
 package protocol
 
 import (
@@ -146,4 +147,17 @@ func BuildResponse(reqID uint32, status byte, data []byte) []byte {
 		copy(resp[6:], data)
 	}
 	return resp
+}
+
+// IsARQPacket 检查是否可能是 ARQ 包
+// ARQ 包格式: Seq(4) + Ack(4) + Flags(1) + Len(2) + Payload
+// 协议包格式: Type(1) + ReqID(4) + ...
+// 通过检查第一个字节来区分：ARQ 的 Seq 高位通常不为 0x01-0x03
+func IsARQPacket(data []byte) bool {
+	if len(data) < 11 {
+		return false
+	}
+	// 如果第一个字节是协议类型（0x01, 0x02, 0x03），则是协议包
+	firstByte := data[0]
+	return firstByte != TypeConnect && firstByte != TypeData && firstByte != TypeClose
 }
