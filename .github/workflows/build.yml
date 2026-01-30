@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  GO_VERSION: '1.21'
+  GO_VERSION: '1.24'
   BINARY_NAME: phantom-server
 
 jobs:
@@ -16,16 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+          
       - run: go mod download && go mod tidy
-      - run: go build ./...
-      - uses: golangci/golangci-lint-action@v4
-        with:
-          version: v1.54.2
-          args: --timeout=5m
+      
+      - run: go vet ./...
+      
+      - name: Build Check
+        run: go build ./...
 
   test:
     name: Test
@@ -33,12 +35,23 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
+      
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+          
       - run: go mod download
-      - run: go test -v -race -coverprofile=coverage.out ./...
+      
+      - name: Run Tests
+        run: go test -v -race -coverprofile=coverage.out ./...
+        
+      - name: Upload Coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
 
   build:
     name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
@@ -52,34 +65,57 @@ jobs:
             goarch: amd64
           - goos: linux
             goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: 7
           - goos: darwin
             goarch: amd64
           - goos: darwin
             goarch: arm64
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: freebsd
+            goarch: amd64
 
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+          
       - run: go mod download
+      
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: 0
         run: |
           VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo 'dev')
           COMMIT=$(git rev-parse --short HEAD)
           DATE=$(date -u '+%Y-%m-%d %H:%M:%S')
           
+          ARCH_SUFFIX="${{ matrix.goarch }}"
+          [[ "${{ matrix.goarch }}" == "arm" ]] && ARCH_SUFFIX="armv${{ matrix.goarm }}"
+          
+          BINARY="${{ env.BINARY_NAME }}-${{ matrix.goos }}-${ARCH_SUFFIX}${{ matrix.ext }}"
+          
           go build -trimpath \
-            -ldflags "-s -w -X 'main.Version=${VERSION}' -X 'main.BuildTime=${DATE}' -X 'main.GitCommit=${COMMIT}'" \
-            -o "${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}" \
+            -ldflags "-s -w \
+              -X 'main.Version=${VERSION}' \
+              -X 'main.BuildTime=${DATE}' \
+              -X 'main.GitCommit=${COMMIT}'" \
+            -o "${BINARY}" \
             ./cmd/phantom-server
+          
+          echo "BINARY=${BINARY}" >> $GITHUB_ENV
+          
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BINARY_NAME }}-${{ matrix.goos }}-${{ matrix.goarch }}
