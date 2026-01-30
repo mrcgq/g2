@@ -45,7 +45,7 @@ type Packet struct {
 	Retries int
 }
 
-// Stats 统计信息（使用原子操作）
+// Stats 统计信息
 type Stats struct {
 	PacketsSent    uint64
 	PacketsRecv    uint64
@@ -76,17 +76,16 @@ type Conn struct {
 	rto    time.Duration
 	rttMu  sync.RWMutex
 
-	// 底层发送函数
-	rawSend   func([]byte) error
-	rawSendMu sync.Mutex
+	// 底层发送函数（不需要锁保护，由调用者保证）
+	rawSend func([]byte) error
 
 	// 控制
-	closed   bool
-	closeMu  sync.RWMutex
+	closed   int32 // 使用原子操作
 	closeCh  chan struct{}
 	closeErr error
+	closeMu  sync.Mutex
 
-	// 统计（使用原子操作）
+	// 统计
 	stats Stats
 }
 
@@ -132,12 +131,13 @@ func (c *Conn) Send(data []byte) error {
 
 // sendChunk 发送单个分片
 func (c *Conn) sendChunk(data []byte) error {
+	// 第一步：在锁内准备数据
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
 
 	// 流控：等待发送窗口有空间
 	for len(c.sendBuf) >= MaxInFlight {
 		if c.isClosed() {
+			c.sendMu.Unlock()
 			return ErrClosed
 		}
 		c.sendCond.Wait()
@@ -146,41 +146,34 @@ func (c *Conn) sendChunk(data []byte) error {
 	seq := c.sendSeq
 	c.sendSeq++
 
+	// 复制数据
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+
 	pkt := &Packet{
 		Seq:    seq,
-		Data:   data,
+		Data:   dataCopy,
 		SentAt: time.Now(),
 	}
 	c.sendBuf[seq] = pkt
 
-	// 发送
-	return c.sendPacket(pkt)
-}
-
-// sendPacket 发送数据包
-func (c *Conn) sendPacket(pkt *Packet) error {
+	// 获取 ACK 值
 	c.recvMu.Lock()
 	ack := c.recvSeq - 1
 	c.recvMu.Unlock()
 
-	frame := c.buildFrame(pkt.Seq, ack, FlagData, pkt.Data)
+	// 构建帧
+	frame := c.buildFrame(seq, ack, FlagData, dataCopy)
 
+	// 第二步：释放锁后再发送！
+	c.sendMu.Unlock()
+
+	// 更新统计
 	atomic.AddUint64(&c.stats.PacketsSent, 1)
 	atomic.AddUint64(&c.stats.BytesSent, uint64(len(frame)))
 
-	return c.doSend(frame)
-}
-
-// doSend 实际发送（带锁保护）
-func (c *Conn) doSend(data []byte) error {
-	c.rawSendMu.Lock()
-	defer c.rawSendMu.Unlock()
-	
-	if c.isClosed() {
-		return ErrClosed
-	}
-	
-	return c.rawSend(data)
+	// 发送（不持有任何锁）
+	return c.rawSend(frame)
 }
 
 // OnReceive 处理收到的数据
@@ -216,11 +209,11 @@ func (c *Conn) OnReceive(data []byte) error {
 	case FlagData:
 		return c.handleData(seq, payload)
 	case FlagAck:
-		return nil // 纯 ACK，已处理
+		return nil
 	case FlagPing:
 		return c.handlePing()
 	case FlagPong:
-		return nil // Pong 响应
+		return nil
 	case FlagFin:
 		return c.handleFin()
 	default:
@@ -230,39 +223,51 @@ func (c *Conn) OnReceive(data []byte) error {
 
 // handleData 处理数据包
 func (c *Conn) handleData(seq uint32, payload []byte) error {
-	c.recvMu.Lock()
-	defer c.recvMu.Unlock()
+	var needAck bool
+	var ackValue uint32
 
-	// 发送 ACK（在锁内调用，避免竞争）
-	defer c.sendAckLocked()
+	// 在锁内处理数据
+	c.recvMu.Lock()
 
 	// 重复包
 	if seq < c.recvSeq {
-		return nil
-	}
-
-	// 正好是期望的包
-	if seq == c.recvSeq {
-		// 直接交付
-		c.deliverData(payload)
+		ackValue = c.recvSeq - 1
+		needAck = true
+		c.recvMu.Unlock()
+	} else if seq == c.recvSeq {
+		// 正好是期望的包
+		c.deliverDataLocked(payload)
 		c.recvSeq++
 
 		// 检查缓冲区中的后续包
-		c.deliverBuffered()
-		return nil
+		c.deliverBufferedLocked()
+
+		ackValue = c.recvSeq - 1
+		needAck = true
+		c.recvMu.Unlock()
+	} else {
+		// 乱序包，缓存
+		if _, exists := c.recvBuf[seq]; !exists {
+			dataCopy := make([]byte, len(payload))
+			copy(dataCopy, payload)
+			c.recvBuf[seq] = dataCopy
+		}
+		ackValue = c.recvSeq - 1
+		needAck = true
+		c.recvMu.Unlock()
 	}
 
-	// 乱序包，缓存
-	if _, exists := c.recvBuf[seq]; !exists {
-		c.recvBuf[seq] = make([]byte, len(payload))
-		copy(c.recvBuf[seq], payload)
+	// 在锁外发送 ACK
+	if needAck {
+		frame := c.buildFrame(0, ackValue, FlagAck, nil)
+		_ = c.rawSend(frame)
 	}
 
 	return nil
 }
 
-// deliverData 交付数据到上层
-func (c *Conn) deliverData(data []byte) {
+// deliverDataLocked 交付数据到上层（调用时需持有 recvMu）
+func (c *Conn) deliverDataLocked(data []byte) {
 	if len(data) == 0 {
 		return
 	}
@@ -273,20 +278,19 @@ func (c *Conn) deliverData(data []byte) {
 	select {
 	case c.recvReady <- dataCopy:
 	default:
-		// 缓冲区满，丢弃
 		atomic.AddUint64(&c.stats.PacketsDropped, 1)
 	}
 }
 
-// deliverBuffered 交付缓冲区中连续的包
-func (c *Conn) deliverBuffered() {
+// deliverBufferedLocked 交付缓冲区中连续的包（调用时需持有 recvMu）
+func (c *Conn) deliverBufferedLocked() {
 	for {
 		data, ok := c.recvBuf[c.recvSeq]
 		if !ok {
 			break
 		}
 		delete(c.recvBuf, c.recvSeq)
-		c.deliverData(data)
+		c.deliverDataLocked(data)
 		c.recvSeq++
 	}
 }
@@ -299,7 +303,7 @@ func (c *Conn) handleAck(ack uint32) {
 	acked := false
 	for seq, pkt := range c.sendBuf {
 		if seq <= ack {
-			// 计算 RTT（只对首次发送的包计算）
+			// 计算 RTT
 			if pkt.Retries == 0 {
 				rtt := time.Since(pkt.SentAt)
 				c.updateRTT(rtt)
@@ -314,17 +318,10 @@ func (c *Conn) handleAck(ack uint32) {
 	}
 }
 
-// sendAckLocked 发送 ACK（调用时已持有 recvMu）
-func (c *Conn) sendAckLocked() {
-	ack := c.recvSeq - 1
-	frame := c.buildFrame(0, ack, FlagAck, nil)
-	_ = c.doSend(frame)
-}
-
 // handlePing 处理心跳请求
 func (c *Conn) handlePing() error {
 	frame := c.buildFrame(0, 0, FlagPong, nil)
-	return c.doSend(frame)
+	return c.rawSend(frame)
 }
 
 // handleFin 处理关闭请求
@@ -363,44 +360,57 @@ func (c *Conn) retransmitLoop() {
 
 // checkRetransmit 检查需要重传的包
 func (c *Conn) checkRetransmit() {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-
 	if c.isClosed() {
 		return
 	}
 
+	var toRetransmit *Packet
+	var needClose bool
+
+	// 在锁内找到需要重传的包
+	c.sendMu.Lock()
 	now := time.Now()
 	rto := c.getRTO()
 
 	for _, pkt := range c.sendBuf {
 		if now.Sub(pkt.SentAt) > rto {
 			if pkt.Retries >= MaxRetries {
-				// 超过最大重传次数
-				go c.closeWithError(ErrTimeout)
-				return
+				needClose = true
+				break
 			}
-
 			pkt.Retries++
 			pkt.SentAt = now
 			atomic.AddUint64(&c.stats.PacketsRetrans, 1)
 
-			// 重传
-			c.recvMu.Lock()
-			ack := c.recvSeq - 1
-			c.recvMu.Unlock()
+			// 复制包信息
+			toRetransmit = &Packet{
+				Seq:  pkt.Seq,
+				Data: pkt.Data,
+			}
 
-			frame := c.buildFrame(pkt.Seq, ack, FlagData, pkt.Data)
-			_ = c.doSend(frame)
-
-			// 指数退避：增加 RTO
+			// 指数退避
 			c.rttMu.Lock()
 			c.rto = minDuration(c.rto*2, MaxRTO)
 			c.rttMu.Unlock()
 
-			// 每次只重传一个，避免突发
-			break
+			break // 每次只重传一个
 		}
+	}
+	c.sendMu.Unlock()
+
+	// 在锁外处理
+	if needClose {
+		c.closeWithError(ErrTimeout)
+		return
+	}
+
+	if toRetransmit != nil {
+		c.recvMu.Lock()
+		ack := c.recvSeq - 1
+		c.recvMu.Unlock()
+
+		frame := c.buildFrame(toRetransmit.Seq, ack, FlagData, toRetransmit.Data)
+		_ = c.rawSend(frame)
 	}
 }
 
@@ -428,9 +438,9 @@ func (c *Conn) keepaliveLoop() {
 				return
 			}
 
-			// 发送心跳
+			// 发送心跳（不持有锁）
 			frame := c.buildFrame(0, 0, FlagPing, nil)
-			_ = c.doSend(frame)
+			_ = c.rawSend(frame)
 		}
 	}
 }
@@ -441,11 +451,9 @@ func (c *Conn) updateRTT(sample time.Duration) {
 	defer c.rttMu.Unlock()
 
 	if c.srtt == 0 {
-		// 首次测量
 		c.srtt = sample
 		c.rttvar = sample / 2
 	} else {
-		// RFC 6298 算法
 		diff := c.srtt - sample
 		if diff < 0 {
 			diff = -diff
@@ -454,7 +462,6 @@ func (c *Conn) updateRTT(sample time.Duration) {
 		c.srtt = (7*c.srtt + sample) / 8
 	}
 
-	// RTO = SRTT + 4 * RTTVAR
 	c.rto = c.srtt + 4*c.rttvar
 	if c.rto < MinRTO {
 		c.rto = MinRTO
@@ -520,21 +527,20 @@ func (c *Conn) Close() error {
 
 // closeWithError 带错误关闭
 func (c *Conn) closeWithError(err error) error {
-	c.closeMu.Lock()
-	if c.closed {
-		c.closeMu.Unlock()
-		return nil
+	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
+		return nil // 已经关闭
 	}
-	c.closed = true
+
+	c.closeMu.Lock()
 	if err != nil {
 		c.closeErr = err
 	}
 	close(c.closeCh)
 	c.closeMu.Unlock()
 
-	// 发送 FIN
+	// 发送 FIN（不持有锁）
 	frame := c.buildFrame(0, 0, FlagFin, nil)
-	_ = c.doSend(frame)
+	_ = c.rawSend(frame)
 
 	// 唤醒等待的发送者
 	c.sendCond.Broadcast()
@@ -544,15 +550,13 @@ func (c *Conn) closeWithError(err error) error {
 
 // isClosed 检查是否已关闭
 func (c *Conn) isClosed() bool {
-	c.closeMu.RLock()
-	defer c.closeMu.RUnlock()
-	return c.closed
+	return atomic.LoadInt32(&c.closed) == 1
 }
 
 // getCloseErr 获取关闭错误
 func (c *Conn) getCloseErr() error {
-	c.closeMu.RLock()
-	defer c.closeMu.RUnlock()
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
 	if c.closeErr != nil {
 		return c.closeErr
 	}
