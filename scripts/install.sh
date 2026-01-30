@@ -5,10 +5,9 @@
 
 set -e
 
-# --- 修改部分开始 ---
-VERSION="1.0.4"                  # 必须和你 release 的 tag 一致 (不带 v)
+# --- 配置部分 ---
 GITHUB_REPO="mrcgq/g2"           # 你的仓库地址
-# --- 修改部分结束 ---
+# --- 配置结束 ---
 
 INSTALL_DIR="/opt/phantom"
 CONFIG_DIR="/etc/phantom"
@@ -36,7 +35,7 @@ detect_arch() {
     case $(uname -m) in
         x86_64|amd64)  ARCH="amd64" ;;
         aarch64|arm64) ARCH="arm64" ;;
-        armv7l)        ARCH="armv7" ;;  # 修正 armv7 的识别
+        armv7l)        ARCH="armv7" ;;
         *) log_error "不支持的架构: $(uname -m)"; exit 1 ;;
     esac
 }
@@ -50,6 +49,21 @@ generate_psk() {
     openssl rand -base64 32
 }
 
+# 自动获取最新版本
+get_latest_version() {
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local version
+    
+    version=$(curl -s --connect-timeout 10 "$api_url" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/')
+    
+    if [[ -z "$version" ]]; then
+        log_error "无法获取最新版本，请检查网络或仓库地址"
+        exit 1
+    fi
+    
+    echo "$version"
+}
+
 is_installed() {
     [[ -f "${INSTALL_DIR}/${BINARY_NAME}" ]] && [[ -f "$CONFIG_FILE" ]]
 }
@@ -61,6 +75,10 @@ is_running() {
 do_install() {
     check_root
     detect_arch
+    
+    log_step "获取最新版本..."
+    VERSION=$(get_latest_version)
+    log_info "最新版本: v${VERSION}"
     
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════════════════════════╗"
@@ -94,11 +112,11 @@ do_install() {
         tar -xzf /tmp/phantom.tar.gz -C "$INSTALL_DIR"
         rm /tmp/phantom.tar.gz
     else
-        log_error "下载失败！请检查版本号 v${VERSION} 是否存在，或者网络是否连通。"
+        log_error "下载失败！请检查网络连接。"
         exit 1
     fi
     
-    # 适配解压后的文件结构（有时候解压出来会在子目录里，这里做个保险）
+    # 适配解压后的文件结构
     if [[ -d "${INSTALL_DIR}/package" ]]; then
         mv "${INSTALL_DIR}/package/"* "${INSTALL_DIR}/"
         rmdir "${INSTALL_DIR}/package"
@@ -117,6 +135,9 @@ time_window: 30
 log_level: "${LOG_LEVEL}"
 EOF
     chmod 600 "$CONFIG_FILE"
+    
+    # 保存版本信息
+    echo "$VERSION" > "${CONFIG_DIR}/.version"
     
     log_step "安装服务..."
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
@@ -149,14 +170,14 @@ EOF
     sleep 2
     
     if is_running; then
-        # 生成 vless 格式的链接作为替代演示，或者保持自定义协议
-        LINK="phantom://$(echo -n "{\"v\":${VERSION},\"server\":\"${SERVER_IP}\",\"port\":${PORT},\"psk\":\"${PSK}\"}" | base64 -w 0)"
+        LINK="phantom://$(echo -n "{\"v\":\"${VERSION}\",\"server\":\"${SERVER_IP}\",\"port\":${PORT},\"psk\":\"${PSK}\"}" | base64 -w 0)"
         
         echo ""
         echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║                     安装完成！                                    ║${NC}"
         echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════════╝${NC}"
         echo ""
+        echo -e "  版本:   ${CYAN}v${VERSION}${NC}"
         echo -e "  服务器: ${CYAN}${SERVER_IP}:${PORT}${NC}"
         echo -e "  PSK:    ${YELLOW}${PSK}${NC}"
         echo ""
@@ -169,6 +190,49 @@ EOF
         echo ""
     else
         log_error "启动失败，请检查: journalctl -u ${SERVICE_NAME}"
+    fi
+}
+
+do_update() {
+    check_root
+    detect_arch
+    
+    log_step "检查更新..."
+    LATEST=$(get_latest_version)
+    CURRENT=$(cat "${CONFIG_DIR}/.version" 2>/dev/null || echo "unknown")
+    
+    log_info "当前版本: v${CURRENT}"
+    log_info "最新版本: v${LATEST}"
+    
+    if [[ "$CURRENT" == "$LATEST" ]]; then
+        log_info "已是最新版本"
+        return 0
+    fi
+    
+    read -rp "是否更新到 v${LATEST}? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && { log_info "取消更新"; return 0; }
+    
+    log_step "下载新版本..."
+    URL="https://github.com/${GITHUB_REPO}/releases/download/v${LATEST}/${BINARY_NAME}-linux-${ARCH}.tar.gz"
+    
+    if curl -fSL --progress-bar -o /tmp/phantom.tar.gz "$URL"; then
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        tar -xzf /tmp/phantom.tar.gz -C "$INSTALL_DIR"
+        rm /tmp/phantom.tar.gz
+        
+        if [[ -d "${INSTALL_DIR}/package" ]]; then
+            mv "${INSTALL_DIR}/package/"* "${INSTALL_DIR}/"
+            rmdir "${INSTALL_DIR}/package"
+        fi
+        
+        chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+        echo "$LATEST" > "${CONFIG_DIR}/.version"
+        
+        systemctl start "$SERVICE_NAME"
+        log_info "更新完成: v${CURRENT} -> v${LATEST}"
+    else
+        log_error "下载失败"
+        exit 1
     fi
 }
 
@@ -190,7 +254,8 @@ do_uninstall() {
 
 do_status() {
     if is_installed; then
-        echo -e "安装: ${GREEN}是${NC}"
+        CURRENT=$(cat "${CONFIG_DIR}/.version" 2>/dev/null || echo "unknown")
+        echo -e "安装: ${GREEN}是${NC} (v${CURRENT})"
         if is_running; then
             echo -e "状态: ${GREEN}运行中${NC}"
             PID=$(systemctl show -p MainPID --value "$SERVICE_NAME")
@@ -203,26 +268,31 @@ do_status() {
     fi
 }
 
+show_help() {
+    LATEST=$(get_latest_version 2>/dev/null || echo "unknown")
+    echo "Phantom Server (最新: v${LATEST})"
+    echo ""
+    echo "用法: bash install.sh <命令>"
+    echo ""
+    echo "命令:"
+    echo "  install    安装 (自动获取最新版本)"
+    echo "  update     检查并更新到最新版本"
+    echo "  uninstall  卸载"
+    echo "  status     状态"
+    echo "  start      启动"
+    echo "  stop       停止"
+    echo "  restart    重启"
+    echo "  logs       日志"
+}
+
 case "${1:-}" in
     install)   do_install ;;
+    update)    do_update ;;
     uninstall) do_uninstall ;;
     status)    do_status ;;
     start)     systemctl start "$SERVICE_NAME" && log_info "已启动" ;;
     stop)      systemctl stop "$SERVICE_NAME" && log_info "已停止" ;;
     restart)   systemctl restart "$SERVICE_NAME" && log_info "已重启" ;;
     logs)      journalctl -u "$SERVICE_NAME" -f ;;
-    *)
-        echo "Phantom Server v${VERSION}"
-        echo ""
-        echo "用法: bash install.sh <命令>"
-        echo ""
-        echo "命令:"
-        echo "  install    安装"
-        echo "  uninstall  卸载"
-        echo "  status     状态"
-        echo "  start      启动"
-        echo "  stop       停止"
-        echo "  restart    重启"
-        echo "  logs       日志"
-        ;;
+    *)         show_help ;;
 esac
