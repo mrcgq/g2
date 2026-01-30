@@ -10,11 +10,19 @@ import (
 )
 
 func TestHandlerBasic(t *testing.T) {
-	psk, _ := crypto.GeneratePSK()
-	cry, _ := crypto.New(psk, 30)
+	psk, err := crypto.GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK 失败: %v", err)
+	}
+
+	cry, err := crypto.New(psk, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto 失败: %v", err)
+	}
+
 	h := New(cry, "debug")
 
-	// 设置模拟发送（使用变量避免 lint 警告）
+	// 设置模拟发送
 	h.SetSender(func(data []byte, addr *net.UDPAddr) error {
 		t.Logf("发送 %d 字节到 %s", len(data), addr.String())
 		return nil
@@ -48,8 +56,16 @@ func TestConnCleanup(t *testing.T) {
 		t.Skip("跳过耗时测试")
 	}
 
-	psk, _ := crypto.GeneratePSK()
-	cry, _ := crypto.New(psk, 30)
+	psk, err := crypto.GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK 失败: %v", err)
+	}
+
+	cry, err := crypto.New(psk, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto 失败: %v", err)
+	}
+
 	h := New(cry, "error")
 
 	// 创建一个模拟连接
@@ -59,7 +75,7 @@ func TestConnCleanup(t *testing.T) {
 	}
 	h.conns.Store(uint32(1), c)
 
-	// 等待清理（测试中缩短时间）
+	// 等待清理
 	time.Sleep(35 * time.Second)
 
 	// 检查是否被清理
@@ -69,8 +85,16 @@ func TestConnCleanup(t *testing.T) {
 }
 
 func TestHandlerDecryptFail(t *testing.T) {
-	psk, _ := crypto.GeneratePSK()
-	cry, _ := crypto.New(psk, 30)
+	psk, err := crypto.GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK 失败: %v", err)
+	}
+
+	cry, err := crypto.New(psk, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto 失败: %v", err)
+	}
+
 	h := New(cry, "error")
 
 	// 发送无效数据
@@ -80,5 +104,44 @@ func TestHandlerDecryptFail(t *testing.T) {
 	resp := h.HandlePacket(invalidData, from)
 	if resp != nil {
 		t.Error("无效数据应该返回 nil")
+	}
+}
+
+func TestHandlerWrongPSK(t *testing.T) {
+	psk1, err := crypto.GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK1 失败: %v", err)
+	}
+
+	psk2, err := crypto.GeneratePSK()
+	if err != nil {
+		t.Fatalf("生成 PSK2 失败: %v", err)
+	}
+
+	cry1, err := crypto.New(psk1, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto1 失败: %v", err)
+	}
+
+	cry2, err := crypto.New(psk2, 30)
+	if err != nil {
+		t.Fatalf("创建 Crypto2 失败: %v", err)
+	}
+
+	h := New(cry2, "error")
+
+	// 用 psk1 加密
+	data := []byte{protocol.TypeData, 0, 0, 0, 1}
+	encrypted, err := cry1.Encrypt(data)
+	if err != nil {
+		t.Fatalf("加密失败: %v", err)
+	}
+
+	from := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345}
+
+	// 用 psk2 的 handler 处理，应该失败
+	resp := h.HandlePacket(encrypted, from)
+	if resp != nil {
+		t.Error("错误的 PSK 应该返回 nil")
 	}
 }
