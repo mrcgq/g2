@@ -3,10 +3,6 @@ name: Build
 on:
   push:
     branches: [main, develop]
-    paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - 'scripts/**'
   pull_request:
     branches: [main]
 
