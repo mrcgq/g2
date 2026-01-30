@@ -1,14 +1,15 @@
-
-bash
 #!/usr/bin/env bash
 #═══════════════════════════════════════════════════════════════════════════════
-#                     Phantom Server v3.0 管理脚本
+#                     Phantom Server 管理脚本
 #═══════════════════════════════════════════════════════════════════════════════
 
 set -e
 
-VERSION="3.0.0"
-GITHUB_REPO="anthropics/phantom-server"
+# --- 修改部分开始 ---
+VERSION="1.0.4"                  # 必须和你 release 的 tag 一致 (不带 v)
+GITHUB_REPO="mrcgq/g2"           # 你的仓库地址
+# --- 修改部分结束 ---
+
 INSTALL_DIR="/opt/phantom"
 CONFIG_DIR="/etc/phantom"
 BINARY_NAME="phantom-server"
@@ -35,7 +36,8 @@ detect_arch() {
     case $(uname -m) in
         x86_64|amd64)  ARCH="amd64" ;;
         aarch64|arm64) ARCH="arm64" ;;
-        *) log_error "不支持的架构"; exit 1 ;;
+        armv7l)        ARCH="armv7" ;;  # 修正 armv7 的识别
+        *) log_error "不支持的架构: $(uname -m)"; exit 1 ;;
     esac
 }
 
@@ -83,14 +85,25 @@ do_install() {
     log_step "下载程序..."
     mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
     
+    # 构建下载链接
     URL="https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/${BINARY_NAME}-linux-${ARCH}.tar.gz"
-    if curl -fSL --progress-bar -o /tmp/phantom.tar.gz "$URL" 2>/dev/null; then
+    
+    log_info "下载地址: $URL"
+    
+    if curl -fSL --progress-bar -o /tmp/phantom.tar.gz "$URL"; then
         tar -xzf /tmp/phantom.tar.gz -C "$INSTALL_DIR"
         rm /tmp/phantom.tar.gz
     else
-        URL="https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/${BINARY_NAME}-linux-${ARCH}"
-        curl -fSL --progress-bar -o "${INSTALL_DIR}/${BINARY_NAME}" "$URL"
+        log_error "下载失败！请检查版本号 v${VERSION} 是否存在，或者网络是否连通。"
+        exit 1
     fi
+    
+    # 适配解压后的文件结构（有时候解压出来会在子目录里，这里做个保险）
+    if [[ -d "${INSTALL_DIR}/package" ]]; then
+        mv "${INSTALL_DIR}/package/"* "${INSTALL_DIR}/"
+        rmdir "${INSTALL_DIR}/package"
+    fi
+
     chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
     ln -sf "${INSTALL_DIR}/${BINARY_NAME}" "/usr/local/bin/${BINARY_NAME}"
     
@@ -136,7 +149,8 @@ EOF
     sleep 2
     
     if is_running; then
-        LINK="phantom://$(echo -n "{\"v\":3,\"server\":\"${SERVER_IP}\",\"port\":${PORT},\"psk\":\"${PSK}\"}" | base64 -w 0)"
+        # 生成 vless 格式的链接作为替代演示，或者保持自定义协议
+        LINK="phantom://$(echo -n "{\"v\":${VERSION},\"server\":\"${SERVER_IP}\",\"port\":${PORT},\"psk\":\"${PSK}\"}" | base64 -w 0)"
         
         echo ""
         echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════════╗${NC}"
@@ -200,7 +214,7 @@ case "${1:-}" in
     *)
         echo "Phantom Server v${VERSION}"
         echo ""
-        echo "用法: $0 <命令>"
+        echo "用法: bash install.sh <命令>"
         echo ""
         echo "命令:"
         echo "  install    安装"
@@ -212,21 +226,3 @@ case "${1:-}" in
         echo "  logs       日志"
         ;;
 esac
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
