@@ -1,4 +1,4 @@
-// cmd/phantom-server/main.go
+//cmd/phantom-server/main.go
 package main
 
 import (
