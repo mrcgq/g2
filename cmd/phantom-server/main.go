@@ -1,3 +1,4 @@
+// cmd/phantom-server/main.go
 package main
 
 import (
@@ -10,12 +11,12 @@ import (
 
 	"github.com/anthropics/phantom-server/internal/crypto"
 	"github.com/anthropics/phantom-server/internal/handler"
-	"github.com/anthropics/phantom-server/internal/server"
+	"github.com/anthropics/phantom-server/internal/transport"
 	"gopkg.in/yaml.v3"
 )
 
 var (
-	Version   = "3.0.0"
+	Version   = "3.1.0"
 	BuildTime = "unknown"
 	GitCommit = "unknown"
 )
@@ -34,7 +35,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("Phantom Server v%s\n", Version)
+		fmt.Printf("Phantom Server v%s (TCP)\n", Version)
 		fmt.Printf("  Build: %s\n", BuildTime)
 		fmt.Printf("  Commit: %s\n", GitCommit)
 		return
@@ -58,9 +59,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	h := handler.New(cry, cfg.LogLevel)
-	srv := server.New(cfg.Listen, h, cfg.LogLevel)
-	h.SetSender(srv.SendTo)
+	// 创建 TCP 处理器
+	tcpHandler := handler.NewTCPHandler(cry, cfg.LogLevel)
+
+	// 创建 TCP 服务器
+	srv := transport.NewTCPServer(cfg.Listen, tcpHandler, cfg.LogLevel)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -110,12 +113,18 @@ func loadConfig(path string) (*Config, error) {
 func printBanner(cfg *Config) {
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Println("║            Phantom Server v3.0                           ║")
-	fmt.Println("║            极简 · 无状态 · 抗探测                        ║")
+	fmt.Println("║            Phantom Server v3.1 (TCP)                     ║")
+	fmt.Println("║            极简 · 加密 · 抗探测                          ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
-	fmt.Printf("║  监听: %-49s ║\n", cfg.Listen+" (UDP)")
+	fmt.Printf("║  监听: %-49s ║\n", cfg.Listen+" (TCP)")
 	fmt.Printf("║  时间窗口: %-45s ║\n", fmt.Sprintf("%d 秒", cfg.TimeWindow))
 	fmt.Printf("║  日志级别: %-45s ║\n", cfg.LogLevel)
+	fmt.Println("╠══════════════════════════════════════════════════════════╣")
+	fmt.Println("║  特性:                                                   ║")
+	fmt.Println("║    ✓ TCP 可靠传输                                        ║")
+	fmt.Println("║    ✓ TSKD 时间同步密钥派生                               ║")
+	fmt.Println("║    ✓ ChaCha20-Poly1305 加密                              ║")
+	fmt.Println("║    ✓ 全密文无特征                                        ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
 	fmt.Println("║  按 Ctrl+C 停止                                          ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
