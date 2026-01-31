@@ -20,7 +20,6 @@ type TCPHandler struct {
 	crypto   *crypto.Crypto
 	logLevel int
 
-	// 活跃连接计数
 	activeConns int64
 }
 
@@ -49,11 +48,9 @@ func (h *TCPHandler) HandleConnection(ctx context.Context, clientConn net.Conn) 
 	h.log(2, "新连接: %s", clientAddr)
 	defer h.log(2, "连接关闭: %s", clientAddr)
 
-	// 创建帧读写器
 	reader := transport.NewFrameReader(clientConn, transport.ReadTimeout)
 	writer := transport.NewFrameWriter(clientConn, transport.WriteTimeout)
 
-	// 读取并处理请求
 	for {
 		select {
 		case <-ctx.Done():
@@ -61,7 +58,6 @@ func (h *TCPHandler) HandleConnection(ctx context.Context, clientConn net.Conn) 
 		default:
 		}
 
-		// 读取加密帧
 		encryptedFrame, err := reader.ReadFrame()
 		if err != nil {
 			if err != io.EOF {
@@ -70,29 +66,24 @@ func (h *TCPHandler) HandleConnection(ctx context.Context, clientConn net.Conn) 
 			return
 		}
 
-		// 解密
 		plaintext, err := h.crypto.Decrypt(encryptedFrame)
 		if err != nil {
 			h.log(2, "解密失败: %s - %v", clientAddr, err)
-			return // 解密失败断开连接（可能是攻击）
+			return
 		}
 
-		// 解析请求
 		req, err := protocol.ParseRequest(plaintext)
 		if err != nil {
 			h.log(2, "解析请求失败: %s - %v", clientAddr, err)
 			continue
 		}
 
-		// 处理请求
 		switch req.Type {
 		case protocol.TypeConnect:
-			// Connect 请求：建立到目标的连接并开始代理
 			h.handleConnect(ctx, req, clientConn, reader, writer)
-			return // Connect 完成后退出（代理循环在 handleConnect 中）
+			return
 
 		case protocol.TypeData:
-			// 孤立的 Data 请求（没有 Connect）
 			h.log(2, "收到孤立的 Data 请求: %s", clientAddr)
 			continue
 
@@ -116,21 +107,18 @@ func (h *TCPHandler) handleConnect(
 
 	h.log(1, "连接: %s %s (ID:%d)", network, target, req.ReqID)
 
-	// 连接目标服务器
 	targetConn, err := net.DialTimeout(network, target, 10*time.Second)
 	if err != nil {
 		h.log(2, "连接目标失败: %s - %v", target, err)
-		h.sendResponse(writer, req.ReqID, 0x01, nil) // 失败
+		h.sendResponse(writer, req.ReqID, 0x01, nil)
 		return
 	}
 	defer targetConn.Close()
 
-	// 配置目标连接
 	if tcpConn, ok := targetConn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 	}
 
-	// 如果有初始数据，发送到目标
 	if len(req.Data) > 0 {
 		_ = targetConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		if _, err := targetConn.Write(req.Data); err != nil {
@@ -140,7 +128,6 @@ func (h *TCPHandler) handleConnect(
 		}
 	}
 
-	// 发送成功响应
 	if err := h.sendResponse(writer, req.ReqID, 0x00, nil); err != nil {
 		h.log(2, "发送响应失败: %v", err)
 		return
@@ -148,7 +135,6 @@ func (h *TCPHandler) handleConnect(
 
 	h.log(1, "已建立: %s %s", network, target)
 
-	// 开始双向代理
 	h.proxy(ctx, req.ReqID, clientConn, targetConn, reader, writer)
 }
 
@@ -166,7 +152,6 @@ func (h *TCPHandler) proxy(
 
 	var wg sync.WaitGroup
 
-	// 客户端 -> 目标
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -174,7 +159,6 @@ func (h *TCPHandler) proxy(
 		h.clientToTarget(ctx, reqID, clientConn, targetConn, reader)
 	}()
 
-	// 目标 -> 客户端
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -201,7 +185,6 @@ func (h *TCPHandler) clientToTarget(
 		default:
 		}
 
-		// 读取加密帧
 		encryptedFrame, err := reader.ReadFrame()
 		if err != nil {
 			if err != io.EOF {
@@ -210,14 +193,12 @@ func (h *TCPHandler) clientToTarget(
 			return
 		}
 
-		// 解密
 		plaintext, err := h.crypto.Decrypt(encryptedFrame)
 		if err != nil {
 			h.log(2, "解密失败: ID:%d - %v", reqID, err)
 			return
 		}
 
-		// 解析
 		req, err := protocol.ParseRequest(plaintext)
 		if err != nil {
 			h.log(2, "解析失败: ID:%d - %v", reqID, err)
@@ -260,19 +241,16 @@ func (h *TCPHandler) targetToClient(
 		default:
 		}
 
-		// 从目标读取
 		_ = targetConn.SetReadDeadline(time.Now().Add(transport.ReadTimeout))
 		n, err := targetConn.Read(buf)
 		if err != nil {
 			if err != io.EOF {
 				h.log(2, "读取目标失败: ID:%d - %v", reqID, err)
 			}
-			// 发送关闭通知
 			_ = h.sendResponse(writer, reqID, protocol.TypeClose, nil)
 			return
 		}
 
-		// 发送到客户端
 		if err := h.sendResponse(writer, reqID, protocol.TypeData, buf[:n]); err != nil {
 			h.log(2, "发送到客户端失败: ID:%d - %v", reqID, err)
 			return
@@ -282,16 +260,13 @@ func (h *TCPHandler) targetToClient(
 
 // sendResponse 发送响应
 func (h *TCPHandler) sendResponse(writer *transport.FrameWriter, reqID uint32, status byte, data []byte) error {
-	// 构建响应
 	resp := protocol.BuildResponse(reqID, status, data)
 
-	// 加密
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
 		return fmt.Errorf("加密失败: %w", err)
 	}
 
-	// 发送帧
 	return writer.WriteFrame(encrypted)
 }
 
