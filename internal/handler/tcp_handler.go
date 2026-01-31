@@ -1,4 +1,5 @@
-//internal/handler/tcp_handler.go
+// internal/handler/tcp_handler.go
+
 package handler
 
 import (
@@ -126,6 +127,7 @@ func (h *TCPHandler) handleConnect(data []byte, clientConn net.Conn, writer *tra
 		ip := net.IP(data[offset : offset+4])
 		port = uint16(data[offset+4])<<8 | uint16(data[offset+5])
 		targetAddr = fmt.Sprintf("%s:%d", ip.String(), port)
+		offset += 6 // ← 修复：更新 offset
 
 	case protocol.AddrIPv6:
 		if len(data) < offset+18 {
@@ -134,6 +136,7 @@ func (h *TCPHandler) handleConnect(data []byte, clientConn net.Conn, writer *tra
 		ip := net.IP(data[offset : offset+16])
 		port = uint16(data[offset+16])<<8 | uint16(data[offset+17])
 		targetAddr = fmt.Sprintf("[%s]:%d", ip.String(), port)
+		offset += 18 // ← 修复：更新 offset
 
 	case protocol.AddrDomain:
 		if len(data) < offset+1 {
@@ -146,10 +149,18 @@ func (h *TCPHandler) handleConnect(data []byte, clientConn net.Conn, writer *tra
 		domain := string(data[offset+1 : offset+1+domainLen])
 		port = uint16(data[offset+1+domainLen])<<8 | uint16(data[offset+1+domainLen+1])
 		targetAddr = fmt.Sprintf("%s:%d", domain, port)
+		offset += 1 + domainLen + 2 // ← 修复：更新 offset
 
 	default:
 		h.logDebug("未知地址类型: 0x%02x", addrType)
 		return h.buildConnectResponse(reqID, protocol.StatusError)
+	}
+
+	// ← 新增：提取 InitData
+	var initData []byte
+	if len(data) > offset {
+		initData = data[offset:]
+		h.logDebug("提取 InitData: %d 字节", len(initData))
 	}
 
 	// 确定网络类型
@@ -171,6 +182,17 @@ func (h *TCPHandler) handleConnect(data []byte, clientConn net.Conn, writer *tra
 	if err != nil {
 		h.logDebug("连接目标失败 %s: %v", targetAddr, err)
 		return h.buildConnectResponse(reqID, protocol.StatusConnectFailed)
+	}
+
+	// ← 新增：如果有 InitData，立即发送给目标
+	if len(initData) > 0 {
+		n, err := targetConn.Write(initData)
+		if err != nil {
+			h.logDebug("发送 InitData 失败: %v", err)
+			targetConn.Close()
+			return h.buildConnectResponse(reqID, protocol.StatusConnectFailed)
+		}
+		h.logDebug("发送 InitData 到目标: %d 字节", n)
 	}
 
 	c := &Conn{
@@ -267,6 +289,7 @@ func (h *TCPHandler) readFromTarget(c *Conn) {
 			c.Target.Close()
 		}
 		c.mu.Unlock()
+		h.logDebug("目标连接关闭: ID=%d", c.ID)
 	}()
 
 	for {
@@ -290,7 +313,7 @@ func (h *TCPHandler) readFromTarget(c *Conn) {
 		c.LastActive = time.Now()
 		c.mu.Unlock()
 
-		h.logDebug("从目标收到: %d 字节", n)
+		h.logDebug("从目标收到: %d 字节 (ID=%d)", n, c.ID)
 
 		// 构建数据包
 		packet := make([]byte, 5+n)
@@ -312,6 +335,7 @@ func (h *TCPHandler) readFromTarget(c *Conn) {
 			h.logDebug("发送数据到客户端失败: %v", err)
 			return
 		}
+		h.logDebug("发送到客户端: %d 字节 (ID=%d)", len(encrypted), c.ID)
 	}
 }
 
