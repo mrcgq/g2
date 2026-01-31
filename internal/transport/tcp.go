@@ -12,13 +12,10 @@ import (
 )
 
 const (
-	// 长度前缀大小（2字节，最大 65535）
 	LengthPrefixSize = 2
-	// 最大包大小
-	MaxPacketSize = 65535
-	// 读写超时
-	ReadTimeout  = 5 * time.Minute
-	WriteTimeout = 30 * time.Second
+	MaxPacketSize    = 65535
+	ReadTimeout      = 5 * time.Minute
+	WriteTimeout     = 30 * time.Second
 )
 
 // TCPServer TCP 服务器
@@ -28,15 +25,13 @@ type TCPServer struct {
 	handler  PacketHandler
 	logLevel int
 
-	// 连接管理
-	conns   sync.Map // net.Conn -> struct{}
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	conns  sync.Map
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 }
 
 // PacketHandler 数据包处理接口
 type PacketHandler interface {
-	// HandleConnection 处理新连接
 	HandleConnection(ctx context.Context, conn net.Conn)
 }
 
@@ -86,7 +81,6 @@ func (s *TCPServer) acceptLoop(ctx context.Context) {
 		default:
 		}
 
-		// 设置 accept 超时，避免阻塞
 		if tcpListener, ok := s.listener.(*net.TCPListener); ok {
 			_ = tcpListener.SetDeadline(time.Now().Add(time.Second))
 		}
@@ -105,17 +99,14 @@ func (s *TCPServer) acceptLoop(ctx context.Context) {
 			}
 		}
 
-		// 配置连接
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetNoDelay(true)
 			_ = tcpConn.SetKeepAlive(true)
 			_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
 		}
 
-		// 记录连接
 		s.conns.Store(conn, struct{}{})
 
-		// 处理连接
 		s.wg.Add(1)
 		go func(c net.Conn) {
 			defer s.wg.Done()
@@ -136,7 +127,6 @@ func (s *TCPServer) Stop() {
 		_ = s.listener.Close()
 	}
 
-	// 关闭所有连接
 	s.conns.Range(func(key, _ interface{}) bool {
 		if conn, ok := key.(net.Conn); ok {
 			_ = conn.Close()
@@ -155,7 +145,7 @@ func (s *TCPServer) log(level int, format string, args ...interface{}) {
 	fmt.Printf("%s %s %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
 
-// FrameReader 帧读取器（处理 TCP 流式数据）
+// FrameReader 帧读取器
 type FrameReader struct {
 	conn    net.Conn
 	buf     []byte
@@ -172,14 +162,11 @@ func NewFrameReader(conn net.Conn, timeout time.Duration) *FrameReader {
 }
 
 // ReadFrame 读取一个完整的帧
-// 格式: Length(2) + Data(Length)
 func (r *FrameReader) ReadFrame() ([]byte, error) {
-	// 设置读取超时
 	if r.timeout > 0 {
 		_ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
 	}
 
-	// 读取长度前缀
 	lengthBuf := r.buf[:LengthPrefixSize]
 	if _, err := io.ReadFull(r.conn, lengthBuf); err != nil {
 		return nil, err
@@ -193,13 +180,11 @@ func (r *FrameReader) ReadFrame() ([]byte, error) {
 		return nil, fmt.Errorf("帧太大: %d", length)
 	}
 
-	// 读取数据
 	data := r.buf[LengthPrefixSize : LengthPrefixSize+length]
 	if _, err := io.ReadFull(r.conn, data); err != nil {
 		return nil, err
 	}
 
-	// 返回数据的副本（因为 buf 会被重用）
 	result := make([]byte, length)
 	copy(result, data)
 	return result, nil
@@ -231,16 +216,13 @@ func (w *FrameWriter) WriteFrame(data []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// 设置写入超时
 	if w.timeout > 0 {
 		_ = w.conn.SetWriteDeadline(time.Now().Add(w.timeout))
 	}
 
-	// 构建帧: Length(2) + Data
 	binary.BigEndian.PutUint16(w.buf[:LengthPrefixSize], uint16(len(data)))
 	copy(w.buf[LengthPrefixSize:], data)
 
-	// 写入
 	total := LengthPrefixSize + len(data)
 	_, err := w.conn.Write(w.buf[:total])
 	return err
