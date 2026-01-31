@@ -59,10 +59,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 创建 TCP 处理器
 	tcpHandler := handler.NewTCPHandler(cry, cfg.LogLevel)
-
-	// 创建 TCP 服务器
 	srv := transport.NewTCPServer(cfg.Listen, tcpHandler, cfg.LogLevel)
 
 	ctx, cancel := context.WithCancel(context.Background())
