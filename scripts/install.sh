@@ -1,6 +1,7 @@
+//scripts/install.sh
 #!/usr/bin/env bash
 #═══════════════════════════════════════════════════════════════════════════════
-#                     Phantom Server 一键管理脚本 v3.1
+#                     Phantom Server 一键管理脚本 v3.1 (TCP)
 #═══════════════════════════════════════════════════════════════════════════════
 
 #───────────────────────────────────────────────────────────────────────────────
@@ -82,25 +83,26 @@ is_installed() { [[ -f "${INSTALL_DIR}/${BINARY_NAME}" ]]; }
 is_running()   { systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; }
 
 generate_share_link() {
-    local json="{\"v\":\"$1\",\"server\":\"$2\",\"port\":$3,\"psk\":\"$4\"}"
+    local json="{\"v\":\"$1\",\"server\":\"$2\",\"port\":$3,\"psk\":\"$4\",\"transport\":\"tcp\"}"
     echo "phantom://$(echo -n "$json" | base64 -w 0 2>/dev/null || echo -n "$json" | base64)"
 }
 
 configure_firewall() {
     local port=$1
     
+    # TCP 端口
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "$port/udp" &>/dev/null
+        ufw allow "$port/tcp" &>/dev/null
     fi
     
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="$port/udp" &>/dev/null
+        firewall-cmd --permanent --add-port="$port/tcp" &>/dev/null
         firewall-cmd --reload &>/dev/null
     fi
     
     if command -v iptables &>/dev/null; then
-        iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
     fi
 }
 
@@ -114,7 +116,7 @@ cmd_install() {
     
     echo ""
     line
-    step "开始安装 Phantom Server"
+    step "开始安装 Phantom Server (TCP)"
     line
     echo ""
     
@@ -147,7 +149,7 @@ cmd_install() {
     
     # 配置端口
     echo ""
-    read -rp "UDP 监听端口 [54321]: " PORT
+    read -rp "TCP 监听端口 [54321]: " PORT
     PORT=${PORT:-54321}
     
     if [[ ! "$PORT" =~ ^[0-9]+$ ]] || [[ "$PORT" -lt 1 ]] || [[ "$PORT" -gt 65535 ]]; then
@@ -196,7 +198,7 @@ cmd_install() {
     tar -xzf "$TMP_FILE" -C "$INSTALL_DIR" 2>/dev/null
     rm -f "$TMP_FILE"
     
-    # 查找二进制文件（处理 phantom-server-linux-amd64 这种名称）
+    # 查找二进制文件
     if [[ ! -f "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
         local found=$(find "$INSTALL_DIR" -maxdepth 1 -name "${BINARY_NAME}*" -type f ! -name "*.yaml" ! -name "*.md" 2>/dev/null | head -1)
         if [[ -n "$found" ]]; then
@@ -224,7 +226,7 @@ cmd_install() {
     
     # 写配置
     cat > "$CONFIG_FILE" << EOF
-# Phantom Server 配置
+# Phantom Server 配置 (TCP)
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 
 listen: ":${PORT}"
@@ -241,7 +243,7 @@ EOF
     
     cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
 [Unit]
-Description=Phantom Server - UDP Proxy
+Description=Phantom Server - TCP Proxy
 After=network.target network-online.target
 Wants=network-online.target
 
@@ -260,8 +262,8 @@ EOF
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" --quiet 2>/dev/null
     
-    # 配置防火墙
-    step "配置防火墙..."
+    # 配置防火墙 (TCP)
+    step "配置防火墙 (TCP)..."
     configure_firewall "$PORT"
     
     # 启动服务
@@ -284,21 +286,21 @@ EOF
         echo -e "${NC}"
         echo ""
         echo -e "  ${WHITE}服务器信息${NC}"
-        echo "  ─────────────────────────────────────────────"
+        echo "  ─────────────────────────────────────────────────────────"
         echo -e "  版本:     ${CYAN}v${VERSION}${NC}"
-        echo -e "  地址:     ${CYAN}${SERVER_IP}:${PORT}${NC} (UDP)"
+        echo -e "  地址:     ${CYAN}${SERVER_IP}:${PORT}${NC} (TCP)"
         echo -e "  日志级别: ${CYAN}${LOG_LEVEL}${NC}"
         echo ""
         echo -e "  ${WHITE}认证信息${NC}"
-        echo "  ─────────────────────────────────────────────"
+        echo "  ─────────────────────────────────────────────────────────"
         echo -e "  PSK: ${YELLOW}${PSK}${NC}"
         echo ""
         echo -e "  ${WHITE}分享链接 (复制到客户端)${NC}"
-        echo "  ─────────────────────────────────────────────"
+        echo "  ─────────────────────────────────────────────────────────"
         echo -e "  ${GREEN}${SHARE_LINK}${NC}"
         echo ""
         echo -e "  ${WHITE}管理命令${NC}"
-        echo "  ─────────────────────────────────────────────"
+        echo "  ─────────────────────────────────────────────────────────"
         echo -e "  启动: ${CYAN}systemctl start ${SERVICE_NAME}${NC}"
         echo -e "  停止: ${CYAN}systemctl stop ${SERVICE_NAME}${NC}"
         echo -e "  重启: ${CYAN}systemctl restart ${SERVICE_NAME}${NC}"
@@ -308,11 +310,11 @@ EOF
         
         # 保存客户端信息
         cat > "${CONFIG_DIR}/client.txt" << EOF
-# Phantom Server 客户端配置
+# Phantom Server 客户端配置 (TCP)
 # 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
 
 服务器: ${SERVER_IP}
-端口: ${PORT}
+端口: ${PORT} (TCP)
 PSK: ${PSK}
 
 分享链接:
@@ -521,6 +523,7 @@ cmd_status() {
         local version=$(get_current_version)
         echo -e "  安装状态: ${GREEN}已安装${NC}"
         echo -e "  版本:     ${CYAN}v${version}${NC}"
+        echo -e "  传输协议: ${CYAN}TCP${NC}"
         echo -e "  安装目录: ${CYAN}${INSTALL_DIR}${NC}"
         echo -e "  配置文件: ${CYAN}${CONFIG_FILE}${NC}"
         echo ""
@@ -539,7 +542,7 @@ cmd_status() {
             
             if [[ -f "$CONFIG_FILE" ]]; then
                 local port=$(grep -E '^listen:' "$CONFIG_FILE" 2>/dev/null | sed 's/.*:\([0-9]*\).*/\1/')
-                echo -e "  监听端口: ${CYAN}${port:-未知}${NC} (UDP)"
+                echo -e "  监听端口: ${CYAN}${port:-未知}${NC} (TCP)"
             fi
         else
             echo -e "  运行状态: ${RED}○ 已停止${NC}"
@@ -740,11 +743,11 @@ cmd_newpsk() {
             
             # 更新保存的客户端信息
             cat > "${CONFIG_DIR}/client.txt" << EOF
-# Phantom Server 客户端配置
+# Phantom Server 客户端配置 (TCP)
 # 更新时间: $(date '+%Y-%m-%d %H:%M:%S')
 
 服务器: ${server_ip}
-端口: ${port}
+端口: ${port} (TCP)
 PSK: ${new_psk}
 
 分享链接:
@@ -776,7 +779,7 @@ cmd_link() {
     local version=$(get_current_version)
     
     echo -e "  服务器: ${CYAN}${server_ip:-未知}${NC}"
-    echo -e "  端口:   ${CYAN}${port:-未知}${NC}"
+    echo -e "  端口:   ${CYAN}${port:-未知}${NC} (TCP)"
     echo -e "  PSK:    ${YELLOW}${psk:-未知}${NC}"
     echo ""
     
@@ -816,7 +819,7 @@ cmd_optimize() {
     echo "将进行以下优化:"
     echo "  1. 增加文件描述符限制"
     echo "  2. 优化网络参数"
-    echo "  3. 优化 UDP 缓冲区"
+    echo "  3. 优化 TCP 缓冲区"
     echo ""
     read -rp "是否继续? [Y/n]: " confirm
     
@@ -834,7 +837,7 @@ EOF
     
     # 网络参数
     cat > /etc/sysctl.d/99-phantom.conf << 'EOF'
-# Phantom Server 网络优化
+# Phantom Server 网络优化 (TCP)
 
 # 核心网络
 net.core.somaxconn = 65535
@@ -844,11 +847,6 @@ net.core.wmem_default = 26214400
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 
-# UDP 优化
-net.ipv4.udp_mem = 65536 131072 262144
-net.ipv4.udp_rmem_min = 16384
-net.ipv4.udp_wmem_min = 16384
-
 # TCP 优化
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
@@ -857,6 +855,8 @@ net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
 
 # 文件系统
 fs.file-max = 1048576
@@ -979,6 +979,7 @@ show_menu() {
   ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝   ╚═╝    ╚═════╝ ╚═╝     ╚═╝
 BANNER
         echo -e "${NC}"
+        echo -e "                      ${CYAN}TCP Edition${NC}"
         
         # 显示状态
         local status_text status_color
@@ -1029,8 +1030,6 @@ BANNER
             "")  ;;  # 直接回车，刷新菜单
             *)  warn "无效选项: $choice" ;;
         esac
-        
-        # 不需要"按回车继续"，直接循环回到菜单
     done
 }
 
@@ -1039,7 +1038,7 @@ BANNER
 #───────────────────────────────────────────────────────────────────────────────
 show_help() {
     cat << EOF
-Phantom Server 管理脚本 v3.1
+Phantom Server 管理脚本 v3.1 (TCP)
 
 用法: $0 [命令]
 
