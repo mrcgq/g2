@@ -1,4 +1,4 @@
-// internal/transport/tcp.go
+//internal/transport/tcp.go
 package transport
 
 import (
@@ -18,6 +18,11 @@ const (
 	WriteTimeout     = 30 * time.Second
 )
 
+// PacketHandler 数据包处理接口
+type PacketHandler interface {
+	HandleConnection(ctx context.Context, conn net.Conn)
+}
+
 // TCPServer TCP 服务器
 type TCPServer struct {
 	addr     string
@@ -28,11 +33,6 @@ type TCPServer struct {
 	conns  sync.Map
 	stopCh chan struct{}
 	wg     sync.WaitGroup
-}
-
-// PacketHandler 数据包处理接口
-type PacketHandler interface {
-	HandleConnection(ctx context.Context, conn net.Conn)
 }
 
 // NewTCPServer 创建 TCP 服务器
@@ -57,7 +57,7 @@ func NewTCPServer(addr string, handler PacketHandler, logLevel string) *TCPServe
 func (s *TCPServer) Start(ctx context.Context) error {
 	listener, err := net.Listen("tcp", s.addr)
 	if err != nil {
-		return fmt.Errorf("监听失败: %w", err)
+		return fmt.Errorf("TCP 监听失败: %w", err)
 	}
 	s.listener = listener
 
@@ -81,6 +81,7 @@ func (s *TCPServer) acceptLoop(ctx context.Context) {
 		default:
 		}
 
+		// 设置 Accept 超时，以便能响应停止信号
 		if tcpListener, ok := s.listener.(*net.TCPListener); ok {
 			_ = tcpListener.SetDeadline(time.Now().Add(time.Second))
 		}
@@ -99,6 +100,7 @@ func (s *TCPServer) acceptLoop(ctx context.Context) {
 			}
 		}
 
+		// 配置 TCP 连接
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			_ = tcpConn.SetNoDelay(true)
 			_ = tcpConn.SetKeepAlive(true)
@@ -106,6 +108,7 @@ func (s *TCPServer) acceptLoop(ctx context.Context) {
 		}
 
 		s.conns.Store(conn, struct{}{})
+		s.log(2, "新连接: %s", conn.RemoteAddr())
 
 		s.wg.Add(1)
 		go func(c net.Conn) {
@@ -113,6 +116,7 @@ func (s *TCPServer) acceptLoop(ctx context.Context) {
 			defer func() {
 				s.conns.Delete(c)
 				_ = c.Close()
+				s.log(2, "连接关闭: %s", c.RemoteAddr())
 			}()
 			s.handler.HandleConnection(ctx, c)
 		}(conn)
@@ -127,6 +131,7 @@ func (s *TCPServer) Stop() {
 		_ = s.listener.Close()
 	}
 
+	// 关闭所有连接
 	s.conns.Range(func(key, _ interface{}) bool {
 		if conn, ok := key.(net.Conn); ok {
 			_ = conn.Close()
@@ -135,6 +140,7 @@ func (s *TCPServer) Stop() {
 	})
 
 	s.wg.Wait()
+	s.log(1, "TCP 服务器已停止")
 }
 
 func (s *TCPServer) log(level int, format string, args ...interface{}) {
@@ -145,7 +151,7 @@ func (s *TCPServer) log(level int, format string, args ...interface{}) {
 	fmt.Printf("%s %s %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
 
-// FrameReader 帧读取器
+// FrameReader 帧读取器 - 用于读取长度前缀的帧
 type FrameReader struct {
 	conn    net.Conn
 	buf     []byte
@@ -162,11 +168,13 @@ func NewFrameReader(conn net.Conn, timeout time.Duration) *FrameReader {
 }
 
 // ReadFrame 读取一个完整的帧
+// 帧格式: [长度(2字节)] [数据(N字节)]
 func (r *FrameReader) ReadFrame() ([]byte, error) {
 	if r.timeout > 0 {
 		_ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
 	}
 
+	// 读取长度前缀
 	lengthBuf := r.buf[:LengthPrefixSize]
 	if _, err := io.ReadFull(r.conn, lengthBuf); err != nil {
 		return nil, err
@@ -180,17 +188,19 @@ func (r *FrameReader) ReadFrame() ([]byte, error) {
 		return nil, fmt.Errorf("帧太大: %d", length)
 	}
 
+	// 读取数据
 	data := r.buf[LengthPrefixSize : LengthPrefixSize+length]
 	if _, err := io.ReadFull(r.conn, data); err != nil {
 		return nil, err
 	}
 
+	// 返回副本
 	result := make([]byte, length)
 	copy(result, data)
 	return result, nil
 }
 
-// FrameWriter 帧写入器
+// FrameWriter 帧写入器 - 用于写入长度前缀的帧
 type FrameWriter struct {
 	conn    net.Conn
 	buf     []byte
@@ -208,6 +218,7 @@ func NewFrameWriter(conn net.Conn, timeout time.Duration) *FrameWriter {
 }
 
 // WriteFrame 写入一个帧
+// 帧格式: [长度(2字节)] [数据(N字节)]
 func (w *FrameWriter) WriteFrame(data []byte) error {
 	if len(data) > MaxPacketSize {
 		return fmt.Errorf("数据太大: %d > %d", len(data), MaxPacketSize)
@@ -220,7 +231,9 @@ func (w *FrameWriter) WriteFrame(data []byte) error {
 		_ = w.conn.SetWriteDeadline(time.Now().Add(w.timeout))
 	}
 
+	// 写入长度前缀
 	binary.BigEndian.PutUint16(w.buf[:LengthPrefixSize], uint16(len(data)))
+	// 写入数据
 	copy(w.buf[LengthPrefixSize:], data)
 
 	total := LengthPrefixSize + len(data)
