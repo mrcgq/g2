@@ -1,284 +1,285 @@
-// internal/handler/tcp_handler.go
+//internal/handler/handler.go
 package handler
 
 import (
-	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/anthropics/phantom-server/internal/crypto"
 	"github.com/anthropics/phantom-server/internal/protocol"
-	"github.com/anthropics/phantom-server/internal/transport"
 )
 
-// TCPHandler TCP 连接处理器
-type TCPHandler struct {
+// Conn 表示一个代理连接
+type Conn struct {
+	ID         uint32
+	Target     io.ReadWriteCloser
+	ClientAddr *net.UDPAddr
+	LastActive time.Time
+	Network    byte
+}
+
+// Handler 处理代理请求
+type Handler struct {
 	crypto   *crypto.Crypto
-	logLevel int
-
-	activeConns int64
+	conns    sync.Map // map[uint32]*Conn
+	sender   func(data []byte, addr *net.UDPAddr) error
+	logLevel string
+	mu       sync.Mutex
 }
 
-// NewTCPHandler 创建 TCP 处理器
-func NewTCPHandler(c *crypto.Crypto, logLevel string) *TCPHandler {
-	level := 1
-	switch logLevel {
-	case "debug":
-		level = 2
-	case "error":
-		level = 0
-	}
-
-	return &TCPHandler{
+// New 创建新的 Handler
+func New(c *crypto.Crypto, logLevel string) *Handler {
+	h := &Handler{
 		crypto:   c,
-		logLevel: level,
+		logLevel: logLevel,
 	}
+	go h.cleanupLoop()
+	return h
 }
 
-// HandleConnection 处理一个客户端连接
-func (h *TCPHandler) HandleConnection(ctx context.Context, clientConn net.Conn) {
-	atomic.AddInt64(&h.activeConns, 1)
-	defer atomic.AddInt64(&h.activeConns, -1)
-
-	clientAddr := clientConn.RemoteAddr().String()
-	h.log(2, "新连接: %s", clientAddr)
-	defer h.log(2, "连接关闭: %s", clientAddr)
-
-	reader := transport.NewFrameReader(clientConn, transport.ReadTimeout)
-	writer := transport.NewFrameWriter(clientConn, transport.WriteTimeout)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		encryptedFrame, err := reader.ReadFrame()
-		if err != nil {
-			if err != io.EOF {
-				h.log(2, "读取帧失败: %s - %v", clientAddr, err)
-			}
-			return
-		}
-
-		plaintext, err := h.crypto.Decrypt(encryptedFrame)
-		if err != nil {
-			h.log(2, "解密失败: %s - %v", clientAddr, err)
-			return
-		}
-
-		req, err := protocol.ParseRequest(plaintext)
-		if err != nil {
-			h.log(2, "解析请求失败: %s - %v", clientAddr, err)
-			continue
-		}
-
-		switch req.Type {
-		case protocol.TypeConnect:
-			h.handleConnect(ctx, req, clientConn, reader, writer)
-			return
-
-		case protocol.TypeData:
-			h.log(2, "收到孤立的 Data 请求: %s", clientAddr)
-			continue
-
-		case protocol.TypeClose:
-			h.log(2, "收到 Close 请求: %s", clientAddr)
-			return
-		}
-	}
+// SetSender 设置发送函数
+func (h *Handler) SetSender(sender func(data []byte, addr *net.UDPAddr) error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sender = sender
 }
 
-// handleConnect 处理 Connect 请求
-func (h *TCPHandler) handleConnect(
-	ctx context.Context,
-	req *protocol.Request,
-	clientConn net.Conn,
-	reader *transport.FrameReader,
-	writer *transport.FrameWriter,
-) {
-	network := req.NetworkString()
-	target := req.TargetAddr()
-
-	h.log(1, "连接: %s %s (ID:%d)", network, target, req.ReqID)
-
-	targetConn, err := net.DialTimeout(network, target, 10*time.Second)
+// HandlePacket 处理收到的数据包
+func (h *Handler) HandlePacket(data []byte, from *net.UDPAddr) []byte {
+	plaintext, err := h.crypto.Decrypt(data)
 	if err != nil {
-		h.log(2, "连接目标失败: %s - %v", target, err)
-		h.sendResponse(writer, req.ReqID, 0x01, nil)
-		return
-	}
-	defer targetConn.Close()
-
-	if tcpConn, ok := targetConn.(*net.TCPConn); ok {
-		_ = tcpConn.SetNoDelay(true)
+		h.logDebug("解密失败: %v", err)
+		return nil
 	}
 
-	if len(req.Data) > 0 {
-		_ = targetConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if _, err := targetConn.Write(req.Data); err != nil {
-			h.log(2, "发送初始数据失败: %v", err)
-			h.sendResponse(writer, req.ReqID, 0x01, nil)
-			return
-		}
+	if len(plaintext) < 1 {
+		return nil
 	}
 
-	if err := h.sendResponse(writer, req.ReqID, 0x00, nil); err != nil {
-		h.log(2, "发送响应失败: %v", err)
-		return
-	}
-
-	h.log(1, "已建立: %s %s", network, target)
-
-	h.proxy(ctx, req.ReqID, clientConn, targetConn, reader, writer)
-}
-
-// proxy 双向代理
-func (h *TCPHandler) proxy(
-	ctx context.Context,
-	reqID uint32,
-	clientConn net.Conn,
-	targetConn net.Conn,
-	reader *transport.FrameReader,
-	writer *transport.FrameWriter,
-) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		h.clientToTarget(ctx, reqID, clientConn, targetConn, reader)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		h.targetToClient(ctx, reqID, targetConn, writer)
-	}()
-
-	wg.Wait()
-	h.log(1, "代理结束: ID:%d", reqID)
-}
-
-// clientToTarget 客户端到目标的数据转发
-func (h *TCPHandler) clientToTarget(
-	ctx context.Context,
-	reqID uint32,
-	clientConn net.Conn,
-	targetConn net.Conn,
-	reader *transport.FrameReader,
-) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		encryptedFrame, err := reader.ReadFrame()
-		if err != nil {
-			if err != io.EOF {
-				h.log(2, "读取客户端数据失败: ID:%d - %v", reqID, err)
-			}
-			return
-		}
-
-		plaintext, err := h.crypto.Decrypt(encryptedFrame)
-		if err != nil {
-			h.log(2, "解密失败: ID:%d - %v", reqID, err)
-			return
-		}
-
-		req, err := protocol.ParseRequest(plaintext)
-		if err != nil {
-			h.log(2, "解析失败: ID:%d - %v", reqID, err)
-			continue
-		}
-
-		switch req.Type {
-		case protocol.TypeData:
-			if len(req.Data) > 0 {
-				_ = targetConn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-				if _, err := targetConn.Write(req.Data); err != nil {
-					h.log(2, "写入目标失败: ID:%d - %v", reqID, err)
-					return
-				}
-			}
-
-		case protocol.TypeClose:
-			h.log(2, "客户端主动关闭: ID:%d", reqID)
-			return
-
-		default:
-			h.log(2, "意外的消息类型: %d", req.Type)
-		}
+	msgType := plaintext[0]
+	switch msgType {
+	case protocol.TypeConnect:
+		return h.handleConnect(plaintext, from)
+	case protocol.TypeData:
+		return h.handleData(plaintext, from)
+	case protocol.TypeDisconnect:
+		return h.handleDisconnect(plaintext, from)
+	default:
+		h.logDebug("未知消息类型: %d", msgType)
+		return nil
 	}
 }
 
-// targetToClient 目标到客户端的数据转发
-func (h *TCPHandler) targetToClient(
-	ctx context.Context,
-	reqID uint32,
-	targetConn net.Conn,
-	writer *transport.FrameWriter,
-) {
-	buf := make([]byte, 32*1024)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		_ = targetConn.SetReadDeadline(time.Now().Add(transport.ReadTimeout))
-		n, err := targetConn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				h.log(2, "读取目标失败: ID:%d - %v", reqID, err)
-			}
-			_ = h.sendResponse(writer, reqID, protocol.TypeClose, nil)
-			return
-		}
-
-		if err := h.sendResponse(writer, reqID, protocol.TypeData, buf[:n]); err != nil {
-			h.log(2, "发送到客户端失败: ID:%d - %v", reqID, err)
-			return
-		}
+func (h *Handler) handleConnect(data []byte, from *net.UDPAddr) []byte {
+	if len(data) < 7 {
+		return nil
 	}
+
+	reqID := uint32(data[1])<<24 | uint32(data[2])<<16 | uint32(data[3])<<8 | uint32(data[4])
+	network := data[5]
+	addrType := data[6]
+
+	var targetAddr string
+	var port uint16
+	offset := 7
+
+	switch addrType {
+	case protocol.AddrIPv4:
+		if len(data) < offset+6 {
+			return nil
+		}
+		ip := net.IP(data[offset : offset+4])
+		port = uint16(data[offset+4])<<8 | uint16(data[offset+5])
+		targetAddr = fmt.Sprintf("%s:%d", ip.String(), port)
+
+	case protocol.AddrIPv6:
+		if len(data) < offset+18 {
+			return nil
+		}
+		ip := net.IP(data[offset : offset+16])
+		port = uint16(data[offset+16])<<8 | uint16(data[offset+17])
+		targetAddr = fmt.Sprintf("[%s]:%d", ip.String(), port)
+
+	case protocol.AddrDomain:
+		if len(data) < offset+1 {
+			return nil
+		}
+		domainLen := int(data[offset])
+		if len(data) < offset+1+domainLen+2 {
+			return nil
+		}
+		domain := string(data[offset+1 : offset+1+domainLen])
+		port = uint16(data[offset+1+domainLen])<<8 | uint16(data[offset+1+domainLen+1])
+		targetAddr = fmt.Sprintf("%s:%d", domain, port)
+
+	default:
+		return h.buildConnectResponse(reqID, protocol.StatusError)
+	}
+
+	// 建立连接
+	var conn net.Conn
+	var dialErr error
+
+	switch network {
+	case protocol.NetworkTCP:
+		conn, dialErr = net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	case protocol.NetworkUDP:
+		conn, dialErr = net.DialTimeout("udp", targetAddr, 10*time.Second)
+	default:
+		return h.buildConnectResponse(reqID, protocol.StatusError)
+	}
+
+	if dialErr != nil {
+		h.logDebug("连接失败 %s: %v", targetAddr, dialErr)
+		return h.buildConnectResponse(reqID, protocol.StatusConnectFailed)
+	}
+
+	c := &Conn{
+		ID:         reqID,
+		Target:     conn,
+		ClientAddr: from,
+		LastActive: time.Now(),
+		Network:    network,
+	}
+	h.conns.Store(reqID, c)
+
+	// 启动读取协程
+	go h.readFromTarget(c)
+
+	h.logDebug("连接建立: %d -> %s", reqID, targetAddr)
+	return h.buildConnectResponse(reqID, protocol.StatusOK)
 }
 
-// sendResponse 发送响应
-func (h *TCPHandler) sendResponse(writer *transport.FrameWriter, reqID uint32, status byte, data []byte) error {
-	resp := protocol.BuildResponse(reqID, status, data)
+func (h *Handler) handleData(data []byte, from *net.UDPAddr) []byte {
+	if len(data) < 5 {
+		return nil
+	}
+
+	connID := uint32(data[1])<<24 | uint32(data[2])<<16 | uint32(data[3])<<8 | uint32(data[4])
+	payload := data[5:]
+
+	v, ok := h.conns.Load(connID)
+	if !ok {
+		return nil
+	}
+
+	c := v.(*Conn)
+	c.LastActive = time.Now()
+
+	if c.Target != nil {
+		_, err := c.Target.Write(payload)
+		if err != nil {
+			h.logDebug("写入目标失败: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func (h *Handler) handleDisconnect(data []byte, from *net.UDPAddr) []byte {
+	if len(data) < 5 {
+		return nil
+	}
+
+	connID := uint32(data[1])<<24 | uint32(data[2])<<16 | uint32(data[3])<<8 | uint32(data[4])
+
+	if v, ok := h.conns.LoadAndDelete(connID); ok {
+		c := v.(*Conn)
+		if c.Target != nil {
+			c.Target.Close()
+		}
+		h.logDebug("连接关闭: %d", connID)
+	}
+
+	return nil
+}
+
+func (h *Handler) buildConnectResponse(reqID uint32, status byte) []byte {
+	resp := []byte{
+		protocol.TypeConnectResp,
+		byte(reqID >> 24),
+		byte(reqID >> 16),
+		byte(reqID >> 8),
+		byte(reqID),
+		status,
+	}
 
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
-		return fmt.Errorf("加密失败: %w", err)
+		return nil
 	}
-
-	return writer.WriteFrame(encrypted)
+	return encrypted
 }
 
-func (h *TCPHandler) log(level int, format string, args ...interface{}) {
-	if level > h.logLevel {
-		return
+func (h *Handler) readFromTarget(c *Conn) {
+	buf := make([]byte, 65535)
+	for {
+		if c.Target == nil {
+			return
+		}
+
+		n, err := c.Target.Read(buf)
+		if err != nil {
+			h.conns.Delete(c.ID)
+			return
+		}
+
+		c.LastActive = time.Now()
+
+		// 构建数据包
+		packet := make([]byte, 5+n)
+		packet[0] = protocol.TypeData
+		packet[1] = byte(c.ID >> 24)
+		packet[2] = byte(c.ID >> 16)
+		packet[3] = byte(c.ID >> 8)
+		packet[4] = byte(c.ID)
+		copy(packet[5:], buf[:n])
+
+		encrypted, err := h.crypto.Encrypt(packet)
+		if err != nil {
+			continue
+		}
+
+		h.mu.Lock()
+		sender := h.sender
+		h.mu.Unlock()
+
+		if sender != nil {
+			sender(encrypted, c.ClientAddr)
+		}
 	}
-	prefix := map[int]string{0: "[ERROR]", 1: "[INFO]", 2: "[DEBUG]"}[level]
-	fmt.Printf("%s %s %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
 
-// GetActiveConns 获取活跃连接数
-func (h *TCPHandler) GetActiveConns() int64 {
-	return atomic.LoadInt64(&h.activeConns)
+func (h *Handler) cleanupLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		h.cleanup()
+	}
+}
+
+func (h *Handler) cleanup() {
+	now := time.Now()
+	h.conns.Range(func(key, value interface{}) bool {
+		c := value.(*Conn)
+		if now.Sub(c.LastActive) > 5*time.Minute {
+			if c.Target != nil {
+				c.Target.Close()
+			}
+			h.conns.Delete(key)
+			h.logDebug("清理超时连接: %d", c.ID)
+		}
+		return true
+	})
+}
+
+func (h *Handler) logDebug(format string, args ...interface{}) {
+	if h.logLevel == "debug" {
+		log.Printf("[DEBUG] "+format, args...)
+	}
 }
