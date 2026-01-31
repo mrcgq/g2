@@ -31,6 +31,9 @@ type Handler struct {
 	mu       sync.Mutex
 }
 
+// TCPHandler 是 Handler 的别名，用于 TCP 传输
+type TCPHandler = Handler
+
 // New 创建新的 Handler
 func New(c *crypto.Crypto, logLevel string) *Handler {
 	h := &Handler{
@@ -39,6 +42,11 @@ func New(c *crypto.Crypto, logLevel string) *Handler {
 	}
 	go h.cleanupLoop()
 	return h
+}
+
+// NewTCPHandler 创建新的 TCP Handler
+func NewTCPHandler(c *crypto.Crypto, logLevel string) *TCPHandler {
+	return New(c, logLevel)
 }
 
 // SetSender 设置发送函数
@@ -282,4 +290,16 @@ func (h *Handler) logDebug(format string, args ...interface{}) {
 	if h.logLevel == "debug" {
 		log.Printf("[DEBUG] "+format, args...)
 	}
+}
+
+// Close 关闭所有连接
+func (h *Handler) Close() {
+	h.conns.Range(func(key, value interface{}) bool {
+		c := value.(*Conn)
+		if c.Target != nil {
+			c.Target.Close()
+		}
+		h.conns.Delete(key)
+		return true
+	})
 }
