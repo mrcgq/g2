@@ -18,10 +18,12 @@ import (
 // Conn 表示一个代理连接
 type Conn struct {
 	ID         uint32
-	Target     io.ReadWriteCloser
+	Target     net.Conn
 	ClientConn net.Conn
+	Writer     *transport.FrameWriter
 	LastActive time.Time
 	Network    byte
+	closed     bool
 	mu         sync.Mutex
 }
 
@@ -30,7 +32,6 @@ type TCPHandler struct {
 	crypto   *crypto.Crypto
 	conns    sync.Map // map[uint32]*Conn
 	logLevel string
-	mu       sync.Mutex
 }
 
 // NewTCPHandler 创建新的 TCP Handler
@@ -43,10 +44,12 @@ func NewTCPHandler(c *crypto.Crypto, logLevel string) *TCPHandler {
 	return h
 }
 
-// HandleConnection 实现 PacketHandler 接口，处理单个 TCP 连接
+// HandleConnection 实现 PacketHandler 接口，处理单个客户端 TCP 连接
 func (h *TCPHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 	reader := transport.NewFrameReader(conn, transport.ReadTimeout)
 	writer := transport.NewFrameWriter(conn, transport.WriteTimeout)
+
+	h.logDebug("处理新连接: %s", conn.RemoteAddr())
 
 	for {
 		select {
@@ -59,16 +62,19 @@ func (h *TCPHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 		frame, err := reader.ReadFrame()
 		if err != nil {
 			if err != io.EOF {
-				h.logDebug("读取帧失败: %v", err)
+				h.logDebug("读取帧失败 [%s]: %v", conn.RemoteAddr(), err)
 			}
 			return
 		}
+
+		h.logDebug("收到帧: %d 字节", len(frame))
 
 		// 解密
 		plaintext, err := h.crypto.Decrypt(frame)
 		if err != nil {
 			h.logDebug("解密失败: %v", err)
-			continue // 静默丢弃无效数据
+			// 静默丢弃无效数据，不断开连接
+			continue
 		}
 
 		if len(plaintext) < 1 {
@@ -76,32 +82,31 @@ func (h *TCPHandler) HandleConnection(ctx context.Context, conn net.Conn) {
 		}
 
 		// 处理消息
-		var response []byte
 		msgType := plaintext[0]
+		h.logDebug("消息类型: 0x%02x", msgType)
 
 		switch msgType {
 		case protocol.TypeConnect:
-			response = h.handleConnect(plaintext, conn, writer)
+			response := h.handleConnect(plaintext, conn, writer)
+			if response != nil {
+				if err := writer.WriteFrame(response); err != nil {
+					h.logDebug("发送连接响应失败: %v", err)
+					return
+				}
+			}
 		case protocol.TypeData:
 			h.handleData(plaintext)
 		case protocol.TypeDisconnect:
 			h.handleDisconnect(plaintext)
 		default:
-			h.logDebug("未知消息类型: %d", msgType)
-		}
-
-		// 发送响应
-		if response != nil {
-			if err := writer.WriteFrame(response); err != nil {
-				h.logDebug("发送响应失败: %v", err)
-				return
-			}
+			h.logDebug("未知消息类型: 0x%02x", msgType)
 		}
 	}
 }
 
 func (h *TCPHandler) handleConnect(data []byte, clientConn net.Conn, writer *transport.FrameWriter) []byte {
 	if len(data) < 7 {
+		h.logDebug("Connect 数据太短: %d", len(data))
 		return nil
 	}
 
@@ -143,40 +148,45 @@ func (h *TCPHandler) handleConnect(data []byte, clientConn net.Conn, writer *tra
 		targetAddr = fmt.Sprintf("%s:%d", domain, port)
 
 	default:
+		h.logDebug("未知地址类型: 0x%02x", addrType)
 		return h.buildConnectResponse(reqID, protocol.StatusError)
 	}
 
-	// 建立连接
-	var conn net.Conn
-	var dialErr error
-
+	// 确定网络类型
+	var networkStr string
 	switch network {
 	case protocol.NetworkTCP:
-		conn, dialErr = net.DialTimeout("tcp", targetAddr, 10*time.Second)
+		networkStr = "tcp"
 	case protocol.NetworkUDP:
-		conn, dialErr = net.DialTimeout("udp", targetAddr, 10*time.Second)
+		networkStr = "udp"
 	default:
+		h.logDebug("未知网络类型: 0x%02x", network)
 		return h.buildConnectResponse(reqID, protocol.StatusError)
 	}
 
-	if dialErr != nil {
-		h.logDebug("连接失败 %s: %v", targetAddr, dialErr)
+	h.logDebug("连接请求: ID=%d, %s -> %s", reqID, networkStr, targetAddr)
+
+	// 建立到目标的连接
+	targetConn, err := net.DialTimeout(networkStr, targetAddr, 10*time.Second)
+	if err != nil {
+		h.logDebug("连接目标失败 %s: %v", targetAddr, err)
 		return h.buildConnectResponse(reqID, protocol.StatusConnectFailed)
 	}
 
 	c := &Conn{
 		ID:         reqID,
-		Target:     conn,
+		Target:     targetConn,
 		ClientConn: clientConn,
+		Writer:     writer,
 		LastActive: time.Now(),
 		Network:    network,
 	}
 	h.conns.Store(reqID, c)
 
 	// 启动从目标读取数据的协程
-	go h.readFromTarget(c, writer)
+	go h.readFromTarget(c)
 
-	h.logDebug("连接建立: %d -> %s", reqID, targetAddr)
+	h.logDebug("连接建立成功: ID=%d -> %s", reqID, targetAddr)
 	return h.buildConnectResponse(reqID, protocol.StatusOK)
 }
 
@@ -190,16 +200,22 @@ func (h *TCPHandler) handleData(data []byte) {
 
 	v, ok := h.conns.Load(connID)
 	if !ok {
+		h.logDebug("连接不存在: %d", connID)
 		return
 	}
 
 	c := v.(*Conn)
+	c.mu.Lock()
 	c.LastActive = time.Now()
+	target := c.Target
+	c.mu.Unlock()
 
-	if c.Target != nil {
-		_, err := c.Target.Write(payload)
+	if target != nil {
+		n, err := target.Write(payload)
 		if err != nil {
 			h.logDebug("写入目标失败: %v", err)
+		} else {
+			h.logDebug("发送到目标: %d 字节", n)
 		}
 	}
 }
@@ -213,9 +229,12 @@ func (h *TCPHandler) handleDisconnect(data []byte) {
 
 	if v, ok := h.conns.LoadAndDelete(connID); ok {
 		c := v.(*Conn)
+		c.mu.Lock()
+		c.closed = true
 		if c.Target != nil {
 			c.Target.Close()
 		}
+		c.mu.Unlock()
 		h.logDebug("连接关闭: %d", connID)
 	}
 }
@@ -232,25 +251,46 @@ func (h *TCPHandler) buildConnectResponse(reqID uint32, status byte) []byte {
 
 	encrypted, err := h.crypto.Encrypt(resp)
 	if err != nil {
+		h.logDebug("加密响应失败: %v", err)
 		return nil
 	}
 	return encrypted
 }
 
-func (h *TCPHandler) readFromTarget(c *Conn, writer *transport.FrameWriter) {
+func (h *TCPHandler) readFromTarget(c *Conn) {
 	buf := make([]byte, 32*1024) // 32KB 缓冲
+
+	defer func() {
+		h.conns.Delete(c.ID)
+		c.mu.Lock()
+		if c.Target != nil {
+			c.Target.Close()
+		}
+		c.mu.Unlock()
+	}()
+
 	for {
-		if c.Target == nil {
+		c.mu.Lock()
+		if c.closed || c.Target == nil {
+			c.mu.Unlock()
 			return
 		}
+		target := c.Target
+		c.mu.Unlock()
 
-		n, err := c.Target.Read(buf)
+		n, err := target.Read(buf)
 		if err != nil {
-			h.conns.Delete(c.ID)
+			if err != io.EOF {
+				h.logDebug("读取目标失败: %v", err)
+			}
 			return
 		}
 
+		c.mu.Lock()
 		c.LastActive = time.Now()
+		c.mu.Unlock()
+
+		h.logDebug("从目标收到: %d 字节", n)
 
 		// 构建数据包
 		packet := make([]byte, 5+n)
@@ -263,12 +303,13 @@ func (h *TCPHandler) readFromTarget(c *Conn, writer *transport.FrameWriter) {
 
 		encrypted, err := h.crypto.Encrypt(packet)
 		if err != nil {
+			h.logDebug("加密数据失败: %v", err)
 			continue
 		}
 
-		// 发送加密数据
-		if err := writer.WriteFrame(encrypted); err != nil {
-			h.logDebug("发送数据失败: %v", err)
+		// 发送加密数据到客户端
+		if err := c.Writer.WriteFrame(encrypted); err != nil {
+			h.logDebug("发送数据到客户端失败: %v", err)
 			return
 		}
 	}
@@ -287,10 +328,17 @@ func (h *TCPHandler) cleanup() {
 	now := time.Now()
 	h.conns.Range(func(key, value interface{}) bool {
 		c := value.(*Conn)
-		if now.Sub(c.LastActive) > 5*time.Minute {
+		c.mu.Lock()
+		lastActive := c.LastActive
+		c.mu.Unlock()
+
+		if now.Sub(lastActive) > 5*time.Minute {
+			c.mu.Lock()
+			c.closed = true
 			if c.Target != nil {
 				c.Target.Close()
 			}
+			c.mu.Unlock()
 			h.conns.Delete(key)
 			h.logDebug("清理超时连接: %d", c.ID)
 		}
@@ -308,9 +356,12 @@ func (h *TCPHandler) logDebug(format string, args ...interface{}) {
 func (h *TCPHandler) Close() {
 	h.conns.Range(func(key, value interface{}) bool {
 		c := value.(*Conn)
+		c.mu.Lock()
+		c.closed = true
 		if c.Target != nil {
 			c.Target.Close()
 		}
+		c.mu.Unlock()
 		h.conns.Delete(key)
 		return true
 	})
